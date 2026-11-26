@@ -1,6 +1,7 @@
 //! Segment writer, block scanner, and the rebuildable block index (.widx).
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
@@ -11,9 +12,15 @@ use crate::format::*;
 pub const IDX_MAGIC: &[u8; 8] = b"WARTIDX\0";
 
 pub struct Options {
+    /// one open block per source (stream) instead of one shared block
+    pub per_source: bool,
+    /// seal a source's block when its event-time span exceeds this
+    pub block_age_ns: i64,
     pub block_target: usize,
     pub segment_target: u64,
     pub zstd_level: i32,
+    /// build the .wtix term index when a segment closes
+    pub term_index: bool,
 }
 
 /// One block as found in a segment, with its raw summary bytes.
@@ -51,7 +58,7 @@ pub struct Writer {
     opts: Options,
     seg: Option<OpenSegment>,
     prev_id: [u8; 16],
-    builder: BlockBuilder,
+    builders: HashMap<u64, BlockBuilder>,
     pub blocks_written: u64,
     pub bytes_written: u64,
     counter: u64,
@@ -83,13 +90,17 @@ impl Writer {
         fs::create_dir_all(segments_dir(root))?;
         Ok(Writer {
             root: root.to_path_buf(), opts, seg: None, prev_id: [0; 16],
-            builder: BlockBuilder::new(), blocks_written: 0, bytes_written: 0, counter: 0,
+            builders: HashMap::new(), blocks_written: 0, bytes_written: 0, counter: 0,
         })
     }
 
     pub fn push(&mut self, r: &Record) -> Result<()> {
-        self.builder.push(r);
-        if self.builder.approx_len() >= self.opts.block_target { self.flush_block()?; }
+        let key = if self.opts.per_source { r.source.fingerprint() } else { 0 };
+        let stale = self.builders.get(&key).map(|b| !b.is_empty() && r.time_ns - b.summary.min_time > self.opts.block_age_ns).unwrap_or(false);
+        if stale { self.flush_block(key)?; }
+        let b = self.builders.entry(key).or_insert_with(BlockBuilder::new);
+        b.push(r);
+        if b.approx_len() >= self.opts.block_target { self.flush_block(key)?; }
         Ok(())
     }
 
@@ -105,10 +116,9 @@ impl Writer {
         Ok(())
     }
 
-    pub fn flush_block(&mut self) -> Result<()> {
-        if self.builder.is_empty() { return Ok(()); }
+    pub fn flush_block(&mut self, key: u64) -> Result<()> {
+        let builder = match self.builders.remove(&key) { Some(b) if !b.is_empty() => b, _ => return Ok(()) };
         if self.seg.is_none() { self.open_segment()?; }
-        let builder = std::mem::replace(&mut self.builder, BlockBuilder::new());
         let count = builder.summary.count;
         let (payload, summary) = builder.finish();
         let seg = self.seg.as_mut().unwrap();
@@ -135,13 +145,16 @@ impl Writer {
             seg.file.flush()?;
             seg.file.get_ref().sync_all()?;
             write_index(&idx_path(&seg.path), &seg.id, seg.len, &seg.entries)?;
+            if self.opts.term_index { crate::tix::write(&seg.path)?; }
             self.prev_id = seg.id;
         }
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<(u64, u64)> {
-        self.flush_block()?;
+        let mut keys: Vec<u64> = self.builders.keys().copied().collect();
+        keys.sort_unstable();
+        for k in keys { self.flush_block(k)?; }
         self.close_segment()?;
         Ok((self.blocks_written, self.bytes_written))
     }

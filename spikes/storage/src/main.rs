@@ -6,6 +6,7 @@ mod format;
 mod import;
 mod query;
 mod store;
+mod tix;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -36,6 +37,12 @@ enum Cmd {
         #[arg(long, default_value_t = 256)] block_kib: usize,
         #[arg(long, default_value_t = 256)] segment_mib: u64,
         #[arg(long, default_value_t = 3)] zstd: i32,
+        /// one open block per source (stream)
+        #[arg(long)] per_source: bool,
+        /// seal a block when its event-time span exceeds this many seconds
+        #[arg(long, default_value_t = 600)] block_age_s: i64,
+        /// build the .wtix term index for each segment
+        #[arg(long)] term_index: bool,
     },
     /// Query with flags (KQL comes later)
     Query {
@@ -86,6 +93,8 @@ enum IndexOp {
     Verify { #[arg(long)] data: PathBuf },
     /// Delete all index files
     Drop { #[arg(long)] data: PathBuf },
+    /// Build (or rebuild) the .wtix term index for every segment
+    Terms { #[arg(long)] data: PathBuf },
 }
 
 fn now_ns() -> i64 {
@@ -118,7 +127,7 @@ fn dir_size(p: &Path) -> u64 {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Import { data, input, journal, repeat, block_kib, segment_mib, zstd } => {
+        Cmd::Import { data, input, journal, repeat, block_kib, segment_mib, zstd, per_source, block_age_s, term_index } => {
             if store::list_segments(&data)?.len() > 0 { bail!("{} already has segments; use an empty directory", data.display()); }
             if repeat > 1 && input == "-" { bail!("--repeat needs a file --input"); }
             // time span of the input, so repeated copies follow each other
@@ -132,6 +141,7 @@ fn main() -> Result<()> {
             }
             let mut w = store::Writer::create(&data, store::Options {
                 block_target: block_kib * 1024, segment_target: segment_mib << 20, zstd_level: zstd,
+                per_source, block_age_ns: block_age_s * 1_000_000_000, term_index,
             })?;
             let start = std::time::Instant::now();
             let (mut seq, mut in_bytes, mut bad) = (0u64, 0u64, 0u64);
@@ -175,8 +185,8 @@ fn main() -> Result<()> {
                 for r in rows { o.write_all(r.as_bytes())?; o.write_all(b"\n")?; }
             }
             if stats {
-                eprintln!("mode={mode:?} seconds={secs:.4} segments={} index_fallbacks={} blocks={} pruned={} decoded={} decoded_without_match={} matches={} damaged={}",
-                    st.segments, st.index_fallbacks, st.blocks, st.pruned, st.decoded, st.false_positive_blocks, st.matches, st.damaged);
+                eprintln!("mode={mode:?} seconds={secs:.4} segments={} term_index_segments={} index_fallbacks={} blocks={} pruned={} decoded={} decoded_without_match={} matches={} damaged={}",
+                    st.segments, st.term_index_segments, st.index_fallbacks, st.blocks, st.pruned, st.decoded, st.false_positive_blocks, st.matches, st.damaged);
             }
         }
         Cmd::Index { op } => match op {
@@ -185,7 +195,9 @@ fn main() -> Result<()> {
                 let mut blocks = 0;
                 for seg in store::list_segments(&data)? {
                     let _ = std::fs::remove_file(store::idx_path(&seg));
+                    let had_tix = tix::tix_path(&seg).exists();
                     let (n, damaged) = store::rebuild_index(&seg)?;
+                    if had_tix { tix::write(&seg)?; }
                     blocks += n;
                     for (a, b) in damaged { eprintln!("damaged region in {}: bytes {a}..{b}", seg.display()); }
                 }
@@ -198,14 +210,26 @@ fn main() -> Result<()> {
                     let fresh = store::encode_index(&id, len, &rep.blocks);
                     let disk = std::fs::read(store::idx_path(&seg)).unwrap_or_default();
                     if fresh == disk { same += 1 } else { diff += 1; eprintln!("index differs: {}", seg.display()); }
+                    if let Ok(disk) = std::fs::read(tix::tix_path(&seg)) {
+                        if tix::build(&seg)? == disk { same += 1 } else { diff += 1; eprintln!("term index differs: {}", seg.display()); }
+                    }
                 }
                 println!("indexes_identical={same} indexes_different={diff}");
                 if diff > 0 { std::process::exit(1); }
             }
             IndexOp::Drop { data } => {
                 let mut n = 0;
-                for seg in store::list_segments(&data)? { if std::fs::remove_file(store::idx_path(&seg)).is_ok() { n += 1; } }
+                for seg in store::list_segments(&data)? {
+                    if std::fs::remove_file(store::idx_path(&seg)).is_ok() { n += 1; }
+                    if std::fs::remove_file(tix::tix_path(&seg)).is_ok() { n += 1; }
+                }
                 println!("dropped={n}");
+            }
+            IndexOp::Terms { data } => {
+                let start = std::time::Instant::now();
+                let mut bytes = 0;
+                for seg in store::list_segments(&data)? { bytes += tix::write(&seg)?; }
+                println!("term_index_bytes={bytes} seconds={:.3}", start.elapsed().as_secs_f64());
             }
         },
         Cmd::Pick { data } => pick(&data)?,

@@ -60,3 +60,34 @@ Takeaways:
 - **WartLog wins on size by 15x**, which matters for retention: 10 GiB of WartLog holds about as much as 150 GiB of this SQLite layout. It also keeps damage local and has indexes that can be thrown away and rebuilt.
 - **SQLite's load numbers are flattering.** Its indexes were built in bulk after the insert. A live sink maintains them on every insert, which costs more.
 - **Idea worth testing:** because WartLog's indexes are disposable, they could use real inverted structures, either our own (term to block list per segment) or SQLite itself as the index store over our segments. That would combine compact, durable segments with point lookups below a millisecond.
+
+## Round 2: term index and per-source blocks (2M synthetic entries)
+
+Two changes, measured separately:
+
+- **Term index (`.wtix`, `src/tix.rs`)**: one file per segment, memory-mapped and used without parsing. It holds a 56-byte fixed table entry per block (location, time range, severities) and an FST dictionary of body terms (`t:`) and low-cardinality field values (`f:key\0value`). Each entry points to a varint list of block numbers. Fields with more distinct values than 10% of records (ids, timestamps) are left out automatically. A query that uses it never touches the `.widx` file.
+- **Per-source blocks**: the writer keeps one open block per source and seals it at 256 KiB or 10 minutes of event time.
+
+Store sizes: v1 84 MB; v1 plus term index 90 MB (the index is 5.7 MB); v2 (per-source blocks plus term index) **74 MB**, because similar lines compress better together (zstd ratio 9.9 vs 8.0). The term index rebuilds byte-identical (`index verify`).
+
+In-process query time, including materializing every row as JSON (the same work the SQLite tool does), median of 5:
+
+| Query | SQLite | v1 | v2 | v2, 1 thread | rows |
+|---|---|---|---|---|---|
+| Rare term | <0.05 ms | ~6 ms | **0.9 ms** | | 1 |
+| Rare term in time window | <0.05 ms | | **0.8 ms** | | 1 |
+| Unit + time window | 5.7 ms | ~23 ms | **3.3 ms** | | 1,952 |
+| Unit, whole log | 61 ms | ~140 ms | **20 ms** | 63 ms | 20,038 |
+| Errors and worse | 327 ms | ~135 ms | **96 ms** | 366 ms | 40,145 |
+| Everything in a time window | 373 ms | ~280 ms | **180 ms** | 682 ms | 200,132 |
+| Substring (`LIKE` / `contains`) | 420 ms | ~100 ms | **81 ms** | 315 ms | 1 |
+
+Blocks decoded in v2: rare term 1 of 2,276; unit + window 5; unit over the whole log 34 (it was all 1,998 in v1). Row counts match SQLite in every query. A fresh process adds about 5 ms of startup on top of these.
+
+Takeaways:
+
+- **Per-source blocks fixed the unit lookups.** They turned "decode every block" into "decode the blocks of that unit". This was the bigger of the two changes.
+- **The term index made rare terms sub-millisecond.** SQLite is still faster here, because it jumps to one row and we decompress one 256 KB block. That remaining gap is about 0.9 ms, below anything a person notices. Smaller blocks or per-block record offsets would close it if it ever mattered.
+- **Unit + window, and unit over the whole log, now beat SQLite even single-threaded** (63 vs 61 ms is a tie). Broad scans still depend on parallelism.
+- **Cost: import got slower** (33 s vs 16 s), because the spike builds the term index by re-decoding each finished segment. The real writer would collect terms while it builds each block.
+- **Opening the store without a daemon is practical.** Every number above comes from a fresh process that memory-maps the index, with no resident state.

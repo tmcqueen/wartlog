@@ -49,6 +49,7 @@ impl Pred {
 pub struct Stats {
     pub segments: usize,
     pub index_fallbacks: usize,
+    pub term_index_segments: usize,
     pub blocks: u64,
     pub pruned: u64,
     pub decoded: u64,
@@ -92,7 +93,16 @@ pub fn run(root: &Path, mode: Mode, pred: &Pred, want_rows: bool) -> Result<(Vec
     let mut fallbacks = 0;
     let mut damaged = 0u64;
     let mut total_blocks = 0u64;
+    let mut tix_used = 0;
     for (i, seg) in segs.iter().enumerate() {
+        if mode == Mode::Index {
+            if let Some(c) = tix_candidates(seg, pred)? {
+                tix_used += 1;
+                total_blocks += c.1 as u64;
+                work.extend(c.0.into_iter().map(|b| (i, b)));
+                continue;
+            }
+        }
         let blocks = match mode {
             Mode::Index => match load_index(seg)? {
                 Some(b) => b,
@@ -171,7 +181,7 @@ pub fn run(root: &Path, mode: Mode, pred: &Pred, want_rows: bool) -> Result<(Vec
     }).collect();
     rows.par_sort_unstable_by_key(|r| (r.0, r.1));
     let stats = Stats {
-        segments: segs.len(), index_fallbacks: fallbacks, blocks: total_blocks,
+        segments: segs.len(), index_fallbacks: fallbacks, term_index_segments: tix_used, blocks: total_blocks,
         pruned: total_blocks - decoded, decoded, false_positive_blocks: fp_blocks.into_inner(),
         matches: rows.len() as u64, damaged: damaged + corrupt.into_inner(),
     };
@@ -203,4 +213,37 @@ pub fn timed<T>(f: impl FnOnce() -> T) -> (T, f64) {
     let t = Instant::now();
     let r = f();
     (r, t.elapsed().as_secs_f64())
+}
+
+/// Candidate blocks from the memory-mapped term index, or None if it is missing or can't serve the query.
+fn tix_candidates(seg: &Path, pred: &Pred) -> Result<Option<(Vec<BlockLoc>, usize)>> {
+    use std::os::unix::fs::FileExt;
+    let f = File::open(seg)?;
+    let len = f.metadata()?.len();
+    let mut h = [0u8; SEG_HEADER_LEN];
+    f.read_exact_at(&mut h, 0)?;
+    let id = decode_segment_header(&h)?;
+    let t = match crate::tix::Tix::open(seg, &id, len)? { Some(t) => t, None => return Ok(None) };
+    if pred.fields.iter().any(|(k, _)| !t.has_key(k)) { return Ok(None); }
+    let mut cand: Option<Vec<u32>> = None;
+    let mut and = |list: Vec<u32>| {
+        cand = Some(match cand.take() {
+            None => list,
+            Some(c) => { let set: std::collections::HashSet<u32> = list.into_iter().collect(); c.into_iter().filter(|b| set.contains(b)).collect() }
+        });
+    };
+    for h in &pred.has {
+        if h.chars().count() >= 3 { and(t.postings(format!("t:{h}").as_bytes())); }
+    }
+    for (k, v) in &pred.fields { and(t.postings(format!("f:{k}\0{v}").as_bytes())); }
+    let ids: Vec<u32> = cand.unwrap_or_else(|| (0..t.blocks as u32).collect());
+    let mut out = Vec::with_capacity(ids.len());
+    for i in ids {
+        let (b, lo, hi, sev) = t.block(i as usize);
+        if let Some(a) = pred.since_ns { if hi < a { continue; } }
+        if let Some(z) = pred.until_ns { if lo > z { continue; } }
+        if let Some(m) = pred.min_severity { if sev >> m == 0 { continue; } }
+        out.push(b);
+    }
+    Ok(Some((out, t.blocks)))
 }
