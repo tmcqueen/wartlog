@@ -1,6 +1,6 @@
 # WartLog MVP Design
 
-Status: draft for review
+Status: approved by Tim, 2026-11-25
 Date: 2026-11-25
 Owner: Tim (tmcqueen)
 
@@ -28,7 +28,7 @@ The honest bar to beat is a terminal: `journalctl -f | grep`, `kubectl logs -f`,
 - Query with a defined subset of KQL, with time-range pruning that keeps common queries fast on a laptop.
 - A Qt viewer (KDE/Wayland native look) where common tasks need no typing: click to filter, live tail, context around a record, group by message template, logs linked to their trace.
 - Setting up a source is simple: sensible defaults work out of the box, and the viewer shows the exact snippet a sender needs.
-- A small CLI (`wartlog`) for queries, tail, status, and piping any program's output in.
+- A small CLI (`wl`) for queries, tail, status, and piping any program's output in.
 
 ### Non-goals (MVP)
 
@@ -106,7 +106,7 @@ Three forks were decided with Tim. All three picks below were his choice.
                                                                       │
                                      ┌────────────────┬───────────────┼────────────────┐
                                      ▼                ▼               ▼                ▼
-                               Qt viewer        `wartlog` CLI   MCP (phase 1.5)   OTLP forward
+                               Qt viewer        `wl` CLI        MCP (phase 1.5)   OTLP forward
                                (cxx-qt/QML)                                       (to Aspire dashboard)
 ```
 
@@ -120,7 +120,7 @@ Three forks were decided with Tim. All three picks below were his choice.
 | `crates/wartlog-sources` | Receivers and collectors behind the `Receiver` and `Collector` traits, one Cargo feature each. |
 | `crates/wartlog-api` | API message types, framing, and an async client used by the viewer, CLI and MCP. |
 | `crates/wartlogd` | Daemon binary: config, wiring, systemd notify, API server. |
-| `crates/wartlog-cli` | `wartlog` binary: `query`, `tail`, `send`, `sources`, `status`, `index`. Later `mcp`. |
+| `crates/wartlog-cli` | `wl` binary (short on purpose: developers are lazy critters): `query`, `tail`, `send`, `sources`, `status`, `index`. Later `mcp`. |
 | `crates/wartlog-viewer` | Qt viewer with cxx-qt and QML (Kirigami). |
 | `tools/kql-conformance` | Small .NET console app wrapping Kusto.Language. CI only, never shipped. |
 | `docs/format.md` | The normative on-disk format spec, kept in sync with `wartlog-store`. |
@@ -304,7 +304,7 @@ Stored uncompressed after the payload, and copied into the index, so pruning nev
 - **Trace index (`.wtrc`)**, one per segment: sorted `(trace_id, block_seq)` pairs, so "open this trace" is a binary search per segment.
 - **Catalog (`catalog.wcat`)**: one row per segment with its time range, size, and source fingerprints, plus the source descriptors themselves.
 
-Validation: on start and before use, each index is checked against its segment (UUID, covered block sequence, length, CRC). Any mismatch, missing file, or CRC failure triggers a rebuild of that index from the segment by scanning blocks. Rebuilds run in the background in parallel; queries over a segment with no valid index fall back to scanning it. `wartlog index rebuild` forces a full rebuild. Index contents are fully determined by the segment: block index entries in block order, trace index pairs sorted by `(trace_id, block_seq)` and deduplicated, catalog rows sorted by segment creation time then UUID, source descriptors sorted by fingerprint. Incremental updates must produce the same bytes as a rebuild. A required test: delete every index and the catalog, rebuild, and get byte-identical index files and identical query results.
+Validation: on start and before use, each index is checked against its segment (UUID, covered block sequence, length, CRC). Any mismatch, missing file, or CRC failure triggers a rebuild of that index from the segment by scanning blocks. Rebuilds run in the background in parallel; queries over a segment with no valid index fall back to scanning it. `wl index rebuild` forces a full rebuild. Index contents are fully determined by the segment: block index entries in block order, trace index pairs sorted by `(trace_id, block_seq)` and deduplicated, catalog rows sorted by segment creation time then UUID, source descriptors sorted by fingerprint. Incremental updates must produce the same bytes as a rebuild. A required test: delete every index and the catalog, rebuild, and get byte-identical index files and identical query results.
 
 ### Retention
 
@@ -448,14 +448,14 @@ Built with cxx-qt and QML using Kirigami so it follows the Plasma theme. The UI 
 - **Trace link**: records with a trace id open a trace panel listing its spans (name, service, start, duration, status) and its logs in time order.
 - **Saved views**: a named query plus time range, listed in the sidebar.
 - **journald niceties**: unit picker with search, `-x` catalog text shown inline in details.
-- **Add source**: a dialog per source kind that writes the config and shows the sender's snippet (for example the `OTEL_EXPORTER_OTLP_ENDPOINT` value, or a `wartlog send` command line).
+- **Add source**: a dialog per source kind that writes the config and shows the sender's snippet (for example the `OTEL_EXPORTER_OTLP_ENDPOINT` value, or a `wl send` command line).
 - Keyboard first: `Ctrl+K` focuses the query bar, `Ctrl+L` toggles live tail, `/` searches within results, `Esc` clears the selection.
 
 ## 12. Configuration and setup
 
 - Config file: `$XDG_CONFIG_HOME/wartlog/wartlog.toml`. The daemon watches it and hot-reloads sources, and is its only programmatic writer: the viewer's source dialogs call the `sources.*` API, and the daemon edits the file preserving comments (toml_edit). Hand edits by the user are expected and picked up on reload.
 - Out of the box, with no config file: OTLP gRPC and HTTP on loopback, the NDJSON UNIX socket, and the user journal collector are enabled. Kubernetes targets and the system journal are added explicitly.
-- Install: a systemd user unit (`wartlogd.service`, `Type=notify`) and a `.desktop` file for the viewer. Packaging format is the builder's call; `cargo install` plus `wartlog setup` (installs the unit and enables it) is enough for the MVP.
+- Install: a systemd user unit (`wartlogd.service`, `Type=notify`) and a `.desktop` file for the viewer. Packaging format is the builder's call; `cargo install` plus `wl setup` (installs the unit and enables it) is enough for the MVP.
 
 Example:
 
@@ -484,25 +484,25 @@ label_selector = "app.kubernetes.io/part-of=shop"
 The simplest possible source, from any shell:
 
 ```sh
-my-app 2>&1 | wartlog send --source my-app
+my-app 2>&1 | wl send --source my-app
 ```
 
 ## 13. CLI
 
-`wartlog query '<kql>' [--since 1h] [--json]`, `wartlog tail '<kql>'`, `wartlog send --source NAME` (reads stdin lines, NDJSON or plain text), `wartlog sources`, `wartlog status`, `wartlog index rebuild [--segment ID]`, `wartlog setup`. Later: `wartlog mcp`.
+`wl query '<kql>' [--since 1h] [--json]`, `wl tail '<kql>'`, `wl send --source NAME` (reads stdin lines, NDJSON or plain text), `wl sources`, `wl status`, `wl index rebuild [--segment ID]`, `wl setup`. Later: `wl mcp`.
 
 ## 14. Roadmap
 
 **MVP milestones**, in build order. Each ends with something Tim can use.
 
-1. **Store and journald.** Model, WAL, segments, blocks, block index, rebuild, journald collector, a minimal daemon API (handshake and `query` only), and `wartlog query` with `where`/`take`/`sort` only. Real data from day one, and every client goes through the daemon from the start.
-2. **Query and API.** Full KQL subset, pruning, conformance suite, the rest of the daemon API, `wartlog tail`, `wartlog send` and the NDJSON receivers.
+1. **Store and journald.** Model, WAL, segments, blocks, block index, rebuild, journald collector, a minimal daemon API (handshake and `query` only), and `wl query` with `where`/`take`/`sort` only. Real data from day one, and every client goes through the daemon from the start.
+2. **Query and API.** Full KQL subset, pruning, conformance suite, the rest of the daemon API, `wl tail`, `wl send` and the NDJSON receivers.
 3. **Viewer.** Main window, live tail, click to filter, completion, details, context, templates view, saved views.
 4. **OTLP.** gRPC and HTTP receivers, spans, trace index, trace panel, forwarding to the Aspire dashboard.
 5. **Kubernetes.** Collector, source tree entries, add-source dialogs for every kind.
 6. **Hardening.** Crash and corruption test suite, retention, performance pass against the targets below.
 
-**Phase 1.5:** MCP server (`wartlog mcp`, stdio, Rust `rmcp` SDK). Read-only tools: run a KQL query, list sources and fields, top templates, fetch a trace with its logs, record context. Results capped by rows and bytes and summaries preferred over raw dumps. Configurable redaction rules (regexes on attribute keys and values) applied to MCP output. Streamable HTTP transport later if remote agents need it.
+**Phase 1.5:** MCP server (`wl mcp`, stdio, Rust `rmcp` SDK). Read-only tools: run a KQL query, list sources and fields, top templates, fetch a trace with its logs, record context. Results capped by rows and bytes and summaries preferred over raw dumps. Configurable redaction rules (regexes on attribute keys and values) applied to MCP output. Streamable HTTP transport later if remote agents need it.
 
 **Phase 2:** trace waterfall view; Docker collector (Engine API socket); syslog (RFC 5424 and 3164 over UDP, TCP with RFC 6587 framing, UNIX); GELF (UDP with chunking, TCP, HTTP); file tailing; TLS for network receivers; Kusto.Language completions in the viewer if needed; `AddWartLog()` Aspire AppHost extension; per-source retention.
 
