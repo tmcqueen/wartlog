@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <WartLogLibDir Condition="'$(WartLogLibDir)' == ''">$(MSBuildThisFileDirectory)../../../../target/debug</WartLogLibDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/WartLog/WartLog.csproj" />
+    <None Include="$(WartLogLibDir)/libwartlog.so" CopyToOutputDirectory="PreserveNewest" Link="libwartlog.so" />
+  </ItemGroup>
+
+</Project>

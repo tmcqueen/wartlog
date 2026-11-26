@@ -1,6 +1,6 @@
 # WartLog Library and C ABI Design
 
-Status: design agreed with Tim, 2026-11-26. Not built yet. When it is built, [docs/format.md](../../format.md) gains the store manifest and the writer kind field described in section 4, and this file records any differences. Unfamiliar terms are defined in the [glossary](../../glossary.md).
+Status: design agreed with Tim, 2026-11-26. Built 2026-11-26 (section 12 lists the differences). When it is built, [docs/format.md](../../format.md) gains the store manifest and the writer kind field described in section 4, and this file records any differences. Unfamiliar terms are defined in the [glossary](../../glossary.md).
 Date: 2026-11-26
 Owner: Tim (tmcqueen)
 
@@ -216,3 +216,31 @@ Steps 1 and 2 (2026-11-26):
   block metadata only.
 - `wl status` shows the store origin and segment counts per writer kind; `wl index verify` shows
   each segment's writer kind.
+
+Steps 3 to 6 (2026-11-26):
+
+- `Request::Ingest` goes through the writer thread's normal batch queue (`Batch.seqs` carries the
+  reply), so API writes and collector writes share one ordering and one fsync schedule. An empty
+  `Ingest` with `durable` is how a shared writer flushes.
+- The facade crate is named `wartlog` (crates/wartlog). It exposes `Snapshot`, a `Rows` cursor,
+  `Writer` with `WriteMode::{Shared, Private, Exclusive}`, `ErrorKind`, `verify_store`. Library
+  defaults differ from the daemon's: 2 query threads, a 10 000 row cap, and no retention for
+  private and exclusive writers unless asked (a library should not delete data by surprise; the
+  daemon applies its own retention when it next runs).
+- Shared mode checks that the daemon on the socket serves the requested store (by `Status`), and
+  refuses an external store up front, both as `NoDaemon`.
+- `pread` applies to every segment without a valid term index, not only "the open one": that is
+  the only set a reader can tell apart, and it covers the segment crash recovery trims.
+- Not done: the streaming cursor. Plain row results are still produced in full before the first
+  row is returned (bounded by the row cap); aggregations already stream internally. The cursor API
+  is shaped so this can change without touching the ABI. Spans cannot be written yet.
+- `wartlog-api` builds without tokio (`default-features = false`) and has a blocking client;
+  NDJSON normalization moved to `wartlog-model` so the library does not pull in the receivers.
+- C ABI additions beyond the sketch: `wl_version`, `wl_last_error_span` (query error position),
+  `wl_string_free`, `wl_default_store`, `wl_snapshot_stats`, `wl_cursor_remaining`,
+  `wl_cursor_stats_json`, `wl_record_builder_free`. Option structs carry a `size` field. Modes and
+  source kinds are passed as `int` (an out-of-range enum value from C would be undefined behaviour
+  in Rust); `wl_row_get_str` renders any non-null value as text.
+- C# wrapper in `bindings/dotnet` (WartLog package, xunit tests, a sample with write, read and
+  shared commands). Rows are copied into managed values as they are read.
+- `docs/protocol.md` and Arrow output (build step 7) are not done.

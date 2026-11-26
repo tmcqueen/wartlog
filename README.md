@@ -107,7 +107,9 @@ memory still grows with the number of distinct words in a segment.
 
 | Crate | What it is |
 |---|---|
-| `wartlog-model` | record, span, source and value types; message template rendering |
+| `wartlog` | the library for other programs: read stores with KQL, write records (shared, private or exclusive mode); the stable Rust API |
+| `wartlog-ffi` | the C ABI over `wartlog`: `libwartlog.so` and `include/wartlog.h` ([README](crates/wartlog-ffi/README.md)) |
+| `wartlog-model` | record, span, source and value types; message template rendering; NDJSON normalization |
 | `wartlog-store` | write-ahead log (WAL), segments, blocks, term index, catalog, retention, read-only snapshots |
 | `wartlog-query` | the KQL subset: parser, planner (pruning by time, source, terms, trace id) and executor |
 | `wartlog-sources` | receivers and collectors |
@@ -116,11 +118,16 @@ memory still grows with the number of distinct words in a segment.
 | `wartlog-cli` | `wl` |
 | `wartlog-viewer` | the desktop viewer (Qt Quick, cxx-qt), not a workspace member |
 
+`bindings/dotnet` holds the C# wrapper over the C ABI, with tests and a sample
+([README](bindings/dotnet/README.md)).
+
 ## Test
 
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets
+wl store verify          # the seq rules on a real store (read-only)
+dotnet test bindings/dotnet/tests/WartLog.Tests   # after cargo build -p wartlog-ffi
 ```
 
 `crates/wartlogd/tests/crash.rs` kills the real daemon with SIGKILL during ingest several times
