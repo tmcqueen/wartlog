@@ -227,7 +227,7 @@ impl BlockBuilder {
         put_u32(&mut p, self.sources.len() as u32);
         for s in &self.sources {
             put_u64(&mut p, s.fingerprint());
-            p.push(s.kind as u8);
+            p.push(s.kind.code());
             put_u16(&mut p, s.attrs.len() as u16);
             for (k, v) in &s.attrs {
                 put_u32(&mut p, self.string_ix[k.as_bytes()]);
@@ -512,7 +512,13 @@ impl<'a> Rec<'a> {
                     _ => Value::Bytes(self.v.str_bytes(r).to_vec()),
                 }
             }
-            _ => Value::Null,
+            T_NULL => Value::Null,
+            // compatibility policy: a tag this build does not know is a u32 string ref; show its raw bytes
+            _ => {
+                *o += 4;
+                let r = get_u32(p, *o - 4);
+                Value::Bytes(self.v.str_bytes(r).to_vec())
+            }
         };
         v
     }
@@ -522,8 +528,9 @@ impl<'a> Rec<'a> {
         *o += 1 + match tag {
             T_BOOL => 1,
             T_I64 | T_TIMESTAMP | T_DURATION | T_F64 => 8,
-            T_STR | T_JSON | T_BYTES => 4,
-            _ => 0,
+            T_NULL => 0,
+            // T_STR, T_JSON, T_BYTES, and any tag this build does not know (compatibility policy)
+            _ => 4,
         };
     }
 
@@ -642,6 +649,30 @@ pub(crate) mod tests {
             r.span = Some(SpanData { parent_span_id: (seq % 10 == 0).then_some([2; 8]), end_ns: 99, name: "op".into(), kind: 2, status: 1, status_message: "fine".into() });
         }
         r
+    }
+
+    #[test]
+    fn unknown_source_kind_and_value_tag_are_kept() {
+        // compatibility policy: a newer writer's source kind and value tag still read
+        let src = Arc::new(Source::new(SourceKind::Other(42), vec![("x".into(), "y".into())]));
+        let mut r = Record::log(src, 1, 9, "hi");
+        r.seq = 1;
+        r.attrs = vec![("a".into(), Value::Str("raw".into())), ("b".into(), Value::I64(7))];
+        let mut b = BlockBuilder::new();
+        b.push(&r);
+        let (mut p, _) = b.finish();
+        let v = BlockView::parse(p.clone(), 1).unwrap();
+        assert_eq!(v.rec(0).source().kind, SourceKind::Other(42));
+        assert_eq!(v.rec(0).source().display_name(), "kind:42");
+        // rewrite attribute a's tag (T_STR) to a tag this build does not know
+        let tag_at = v.rec(0).attrs_start() + 4;
+        assert_eq!(p[tag_at], T_STR);
+        p[tag_at] = 200;
+        let v = BlockView::parse(p, 1).unwrap();
+        let attrs = v.rec(0).attrs();
+        assert_eq!(attrs[0], ("a".to_string(), Value::Bytes(b"raw".to_vec())));
+        // the following value still decodes: the unknown tag was skipped by its 4-byte width
+        assert_eq!(attrs[1], ("b".to_string(), Value::I64(7)));
     }
 
     #[test]

@@ -175,35 +175,76 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
-/// Kind of source (spec "Source descriptor").
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[repr(u8)]
+/// Kind of source (spec "Source descriptor"). The on-disk code is `code()`; a code this build does
+/// not know is kept as `Other` (format compatibility policy), so the record still reads and shows
+/// the number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SourceKind {
-    Otlp = 1,
-    Journald = 2,
-    K8s = 3,
-    Ndjson = 4,
+    Otlp,
+    Journald,
+    K8s,
+    Ndjson,
+    /// a kind written by a newer version; never 1..=4
+    Other(u8),
 }
 
 impl SourceKind {
+    /// Decodes an on-disk kind code. 0 is never written, so it is the only code refused.
     pub fn from_u8(v: u8) -> Option<SourceKind> {
         Some(match v {
+            0 => return None,
             1 => SourceKind::Otlp,
             2 => SourceKind::Journald,
             3 => SourceKind::K8s,
             4 => SourceKind::Ndjson,
-            _ => return None,
+            n => SourceKind::Other(n),
         })
     }
 
-    pub fn name(self) -> &'static str {
+    /// The on-disk kind code.
+    pub fn code(self) -> u8 {
         match self {
-            SourceKind::Otlp => "otlp",
-            SourceKind::Journald => "journald",
-            SourceKind::K8s => "k8s",
-            SourceKind::Ndjson => "ndjson",
+            SourceKind::Otlp => 1,
+            SourceKind::Journald => 2,
+            SourceKind::K8s => 3,
+            SourceKind::Ndjson => 4,
+            SourceKind::Other(n) => n,
         }
+    }
+
+    /// `otlp`, `journald`, `k8s`, `ndjson`, or `kind:<n>` for a kind this build does not know.
+    pub fn name(self) -> std::borrow::Cow<'static, str> {
+        match self {
+            SourceKind::Otlp => "otlp".into(),
+            SourceKind::Journald => "journald".into(),
+            SourceKind::K8s => "k8s".into(),
+            SourceKind::Ndjson => "ndjson".into(),
+            SourceKind::Other(n) => format!("kind:{n}").into(),
+        }
+    }
+
+    /// Inverse of `name`.
+    pub fn parse(s: &str) -> Option<SourceKind> {
+        Some(match s {
+            "otlp" => SourceKind::Otlp,
+            "journald" => SourceKind::Journald,
+            "k8s" => SourceKind::K8s,
+            "ndjson" => SourceKind::Ndjson,
+            _ => return SourceKind::from_u8(s.strip_prefix("kind:")?.parse().ok()?),
+        })
+    }
+}
+
+impl Serialize for SourceKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<SourceKind, D::Error> {
+        let s = String::deserialize(d)?;
+        SourceKind::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("unknown source kind {s:?}")))
     }
 }
 
@@ -229,7 +270,7 @@ impl Source {
     }
 
     pub fn fingerprint(&self) -> u64 {
-        let mut b = vec![self.kind as u8];
+        let mut b = vec![self.kind.code()];
         for (k, v) in &self.attrs {
             b.extend_from_slice(k.as_bytes());
             b.push(0);
@@ -255,6 +296,7 @@ impl Source {
                 self.get("k8s.container.name").unwrap_or("?")
             ),
             SourceKind::Ndjson => self.get("source.name").unwrap_or("ndjson").to_string(),
+            SourceKind::Other(n) => format!("kind:{n}"),
         }
     }
 }

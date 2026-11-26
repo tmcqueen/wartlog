@@ -46,7 +46,7 @@ impl Catalog {
         put_u32(&mut b, self.sources.len() as u32);
         for (fp, s) in &self.sources {
             put_u64(&mut b, *fp);
-            b.push(s.kind as u8);
+            b.push(s.kind.code());
             put_u16(&mut b, s.attrs.len() as u16);
             for (k, v) in &s.attrs {
                 put_u32(&mut b, k.len() as u32);

@@ -220,7 +220,7 @@ mod tests {
     use crate::block::{encode_block, tests::sample};
 
     fn segment_bytes(blocks: usize) -> Vec<u8> {
-        let mut out = SegmentHeader { id: [1; 16], prev: [0; 16], created_ns: 0 }.encode();
+        let mut out = SegmentHeader { id: [1; 16], prev: [0; 16], created_ns: 0, writer: WriterKind::Daemon }.encode();
         let mut seq = 1;
         for bs in 0..blocks {
             let mut b = BlockBuilder::new();

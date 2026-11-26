@@ -194,6 +194,14 @@ pub async fn status(sh: &Arc<Shared>) -> Result<Status> {
         sources,
         config_path: sh.config_path.display().to_string(),
         config_error: sh.config_error.lock().unwrap().clone(),
+        store_origin: wartlog_store::Manifest::origin_of(&sh.root).map(|o| o.name().to_string()).unwrap_or_else(|e| format!("unreadable: {e:#}")),
+        segment_writers: {
+            let mut m: std::collections::BTreeMap<String, usize> = Default::default();
+            for h in &snap.segments {
+                *m.entry(h.header.writer.name()).or_default() += 1;
+            }
+            m.into_iter().collect()
+        },
         warnings,
     })
 }

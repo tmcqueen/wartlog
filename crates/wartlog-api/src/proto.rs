@@ -145,6 +145,12 @@ pub struct Status {
     pub config_path: String,
     pub config_error: Option<String>,
     pub warnings: Vec<String>,
+    /// `daemon` or `external` (store manifest)
+    #[serde(default)]
+    pub store_origin: String,
+    /// segment count per writer kind (segment header), e.g. ("daemon", 12), ("exclusive", 1)
+    #[serde(default)]
+    pub segment_writers: Vec<(String, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

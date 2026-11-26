@@ -38,7 +38,7 @@ async fn start(dir: tempfile::TempDir) -> D {
         std::fs::write(&cfg, re).unwrap();
     }
     let api = dir.path().join("api.sock");
-    let opts = wartlogd::RunOptions { config_path: cfg, store: Some(dir.path().join("store")), api_socket: Some(api.clone()), reload_every: Duration::from_millis(100) };
+    let opts = wartlogd::RunOptions { config_path: cfg, store: Some(dir.path().join("store")), api_socket: Some(api.clone()), reload_every: Duration::from_millis(100), ..Default::default() };
     let (stop, rx) = tokio::sync::watch::channel(false);
     let h = tokio::spawn(wartlogd::run(opts, rx));
     for _ in 0..300 {
@@ -209,4 +209,38 @@ async fn second_daemon_is_refused() {
     assert!(e.contains("another"), "{e}");
     d.stop.send(true).unwrap();
     d.h.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_store_is_refused_unless_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let w = wartlog_store::Writer::open(&store, wartlog_store::WriterOptions { mode: wartlog_store::WriteMode::Private, ..Default::default() }).unwrap();
+    w.close().unwrap();
+    std::fs::write(dir.path().join("wartlog.toml"), config(dir.path(), &format!("127.0.0.1:{}", free_port()))).unwrap();
+    let opts = |adopt| wartlogd::RunOptions {
+        config_path: dir.path().join("wartlog.toml"),
+        store: Some(store.clone()),
+        api_socket: Some(dir.path().join("api.sock")),
+        adopt,
+        ..Default::default()
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let e = format!("{:#}", wartlogd::run(opts(false), rx).await.unwrap_err());
+    assert!(e.contains("external store"), "{e}");
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let h = tokio::spawn(wartlogd::run(opts(true), rx));
+    for _ in 0..300 {
+        if Client::connect(&dir.path().join("api.sock"), "test").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = Client::connect(&dir.path().join("api.sock"), "test").await.unwrap();
+    match c.call_one(&Request::Status).await.unwrap() {
+        Response::Status { status } => assert_eq!(status.store_origin, "daemon"),
+        other => panic!("{other:?}"),
+    }
+    tx.send(true).unwrap();
+    h.await.unwrap().unwrap();
 }

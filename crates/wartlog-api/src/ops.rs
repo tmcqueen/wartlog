@@ -14,7 +14,7 @@ pub fn query(snap: &Snapshot, kql: &str, time_range: Option<TimeRange>, limit: O
 
 /// The scope filter for `record.context`, as KQL.
 fn scope_filter(r: &wartlog_model::Record, same: ContextScope) -> Option<String> {
-    let src = format!("Source == {} and SourceKind == {}", kql_string(&r.source.display_name()), kql_string(r.source.kind.name()));
+    let src = format!("Source == {} and SourceKind == {}", kql_string(&r.source.display_name()), kql_string(&r.source.kind.name()));
     match same {
         ContextScope::Source => Some(src),
         ContextScope::Thread => {

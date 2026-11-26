@@ -1,7 +1,7 @@
 //! The single writer: assigns seqs, appends to the WAL, keeps one open block per source, seals
 //! blocks into segments, closes segments (building their term index), and enforces retention.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -11,13 +11,42 @@ use std::time::{Duration, Instant};
 use wartlog_model::{time::now_ns, Record};
 
 use crate::block::{encode_block, BlockBuilder};
-use crate::format::SegmentHeader;
+use crate::format::{SegmentHeader, UnsupportedVersion, WriterKind};
+use crate::manifest::{is_new_store, Manifest, Origin};
+use crate::StoreError;
 use crate::reader::{SealedSeqs, SegmentHandle};
 use crate::segment::Segment;
 use crate::wal::WalFile;
 
+/// Who is writing, which decides the stores a writer may open (ownership rules, docs/format.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WriteMode {
+    /// wartlogd: daemon stores only (an external store needs `adopt`); creates a daemon store
+    #[default]
+    Daemon,
+    /// the library on a store it owns: external stores only; creates an external store
+    Private,
+    /// the library on any existing store, with wartlogd stopped; never creates a store
+    Exclusive,
+}
+
+impl WriteMode {
+    pub fn writer_kind(self) -> WriterKind {
+        match self {
+            WriteMode::Daemon => WriterKind::Daemon,
+            WriteMode::Private => WriterKind::Private,
+            WriteMode::Exclusive => WriterKind::Exclusive,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WriterOptions {
+    pub mode: WriteMode,
+    /// daemon mode: turn an external store into a daemon store instead of refusing it
+    pub adopt: bool,
+    /// recorded in the manifest of a store this writer creates ("name version")
+    pub creator: String,
     /// seal a source's block at this uncompressed size
     pub block_target: usize,
     /// seal a source's block this long (wall clock) after its first record
@@ -36,6 +65,9 @@ pub struct WriterOptions {
 impl Default for WriterOptions {
     fn default() -> Self {
         WriterOptions {
+            mode: WriteMode::Daemon,
+            adopt: false,
+            creator: format!("wartlog-store {}", env!("CARGO_PKG_VERSION")),
             block_target: 256 * 1024,
             block_age: Duration::from_secs(5),
             segment_target: 256 << 20,
@@ -94,8 +126,48 @@ pub fn lock_store(root: &Path) -> Result<File> {
     let f = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(crate::lock_path(root))?;
     match f.try_lock() {
         Ok(()) => Ok(f),
-        Err(std::fs::TryLockError::WouldBlock) => bail!("another process is writing {} (is wartlogd running?)", root.display()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Locked(root.to_path_buf()).into()),
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Applies the ownership rules for `mode` (refuse, never warn). Returns the manifest to write
+/// when the store is new. Called before and again after taking the lock.
+fn check_ownership(root: &Path, opts: &WriterOptions) -> Result<Option<Manifest>> {
+    let exists = root.is_dir();
+    let new = !exists || is_new_store(root);
+    let manifest = if exists { Manifest::load(root)? } else { None };
+    match opts.mode {
+        WriteMode::Daemon => {
+            if new {
+                return Ok(Some(Manifest::new(Origin::Daemon, &opts.creator)));
+            }
+            if manifest.as_ref().is_some_and(|m| m.origin == Origin::External) {
+                if !opts.adopt {
+                    return Err(StoreError::ExternalStore(root.to_path_buf()).into());
+                }
+                let mut m = manifest.unwrap();
+                m.origin = Origin::Daemon;
+                return Ok(Some(m));
+            }
+            Ok(None)
+        }
+        WriteMode::Private => {
+            if new {
+                return Ok(Some(Manifest::new(Origin::External, &opts.creator)));
+            }
+            // no manifest on an existing store means a daemon store
+            match manifest {
+                Some(m) if m.origin == Origin::External => Ok(None),
+                _ => Err(StoreError::DaemonStore(root.to_path_buf()).into()),
+            }
+        }
+        WriteMode::Exclusive => {
+            if new {
+                return Err(StoreError::NotFound(root.to_path_buf()).into());
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -103,7 +175,13 @@ impl Writer {
     /// Opens a store for writing: takes the lock, closes a segment left open by a crash, and seals
     /// every WAL record that is not in a segment yet.
     pub fn open(root: &Path, opts: WriterOptions) -> Result<Writer> {
+        // ownership first, so a private writer on a daemon store gets DaemonStore, not Locked
+        check_ownership(root, &opts)?;
         let lock = lock_store(root)?;
+        // again under the lock: the store may have been created in between
+        if let Some(m) = check_ownership(root, &opts)? {
+            m.save(root)?;
+        }
         crate::create_private_dir(&crate::segments_dir(root))?;
         crate::create_private_dir(&crate::wal::wal_dir(root))?;
 
@@ -112,6 +190,11 @@ impl Writer {
         for p in &paths {
             match SegmentHandle::open(p) {
                 Ok(h) => handles.push(h),
+                Err(e) if e.downcast_ref::<UnsupportedVersion>().is_some() => {
+                    // writing on would reuse its seqs: refuse the whole store
+                    let v = e.downcast::<UnsupportedVersion>().unwrap();
+                    return Err(anyhow::Error::new(StoreError::NewerFormat(v)).context(format!("segment {}", p.display())));
+                }
                 Err(e) => {
                     // an empty or headerless file is a segment the crashed writer had just created
                     if std::fs::metadata(p).map(|m| m.len() < crate::format::SEG_HEADER_LEN as u64).unwrap_or(false) {
@@ -284,7 +367,7 @@ impl Writer {
             let path = dir.join(format!("{}.wseg", uuid::Uuid::from_bytes(id).simple()));
             let mut file = OpenOptions::new().create_new(true).append(true).open(&path)?;
             crate::set_private(&path);
-            let hdr = SegmentHeader { id, prev: self.prev_seg_id, created_ns: now }.encode();
+            let hdr = SegmentHeader { id, prev: self.prev_seg_id, created_ns: now, writer: self.opts.mode.writer_kind() }.encode();
             file.write_all(&hdr)?;
             file.sync_all()?;
             crate::sync_dir(&dir);

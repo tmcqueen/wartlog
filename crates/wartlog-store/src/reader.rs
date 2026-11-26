@@ -101,6 +101,8 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn open(root: &Path) -> Result<Snapshot> {
+        // refuse a store format newer than this build (compatibility policy)
+        crate::manifest::Manifest::load(root)?;
         // WAL before segments: a record sealed (and its WAL file deleted) in between is then found
         // in the segment, so nothing falls through the gap; overlap is removed below.
         let wal_records = crate::wal::read_all(root);

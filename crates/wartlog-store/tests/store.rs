@@ -241,3 +241,234 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+mod ownership {
+    use super::*;
+    use wartlog_store::{Manifest, Origin, StoreError, WriteMode, WriterKind};
+
+    fn mode(m: WriteMode) -> WriterOptions {
+        WriterOptions { mode: m, ..opts() }
+    }
+
+    fn err_of(r: anyhow::Result<Writer>) -> StoreError {
+        let e = r.err().expect("open should fail");
+        match StoreError::find(&e) {
+            Some(StoreError::Locked(p)) => StoreError::Locked(p.clone()),
+            Some(StoreError::DaemonStore(p)) => StoreError::DaemonStore(p.clone()),
+            Some(StoreError::ExternalStore(p)) => StoreError::ExternalStore(p.clone()),
+            Some(StoreError::NotFound(p)) => StoreError::NotFound(p.clone()),
+            Some(StoreError::NewerFormat(v)) => StoreError::NewerFormat(v.clone()),
+            None => panic!("not a StoreError: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn daemon_creates_a_daemon_store_and_marks_segments() {
+        let d = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(d.path(), opts()).unwrap();
+        w.push(rec(1)).unwrap();
+        w.close().unwrap();
+        let m = Manifest::load(d.path()).unwrap().unwrap();
+        assert_eq!(m.origin, Origin::Daemon);
+        assert!(m.creator.starts_with("wartlog-store"));
+        let s = Snapshot::open(d.path()).unwrap();
+        assert_eq!(s.segments[0].header.writer, WriterKind::Daemon);
+    }
+
+    #[test]
+    fn private_writer_owns_an_external_store() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("app.wartlogx");
+        let mut w = Writer::open(&root, mode(WriteMode::Private)).unwrap();
+        w.push(rec(1)).unwrap();
+        w.close().unwrap();
+        assert_eq!(Manifest::load(&root).unwrap().unwrap().origin, Origin::External);
+        assert_eq!(Snapshot::open(&root).unwrap().segments[0].header.writer, WriterKind::Private);
+        // reopening privately is fine; the daemon refuses it until adopted
+        Writer::open(&root, mode(WriteMode::Private)).unwrap().close().unwrap();
+        assert!(matches!(err_of(Writer::open(&root, opts())), StoreError::ExternalStore(_)));
+        Writer::open(&root, WriterOptions { adopt: true, ..opts() }).unwrap().close().unwrap();
+        assert_eq!(Manifest::load(&root).unwrap().unwrap().origin, Origin::Daemon);
+        // now it is a daemon store: private is refused
+        assert!(matches!(err_of(Writer::open(&root, mode(WriteMode::Private))), StoreError::DaemonStore(_)));
+    }
+
+    #[test]
+    fn private_refuses_a_store_without_manifest() {
+        // every store made before manifests existed is a daemon store
+        let d = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(d.path(), opts()).unwrap();
+        w.push(rec(1)).unwrap();
+        w.close().unwrap();
+        std::fs::remove_file(wartlog_store::manifest::manifest_path(d.path())).unwrap();
+        assert!(matches!(err_of(Writer::open(d.path(), mode(WriteMode::Private))), StoreError::DaemonStore(_)));
+        // the daemon opens it as before and does not need a manifest
+        Writer::open(d.path(), opts()).unwrap().close().unwrap();
+    }
+
+    #[test]
+    fn private_on_a_locked_daemon_store_says_daemon_store() {
+        let d = tempfile::tempdir().unwrap();
+        let _daemon = Writer::open(d.path(), opts()).unwrap();
+        assert!(matches!(err_of(Writer::open(d.path(), mode(WriteMode::Private))), StoreError::DaemonStore(_)));
+        assert!(matches!(err_of(Writer::open(d.path(), mode(WriteMode::Exclusive))), StoreError::Locked(_)));
+    }
+
+    #[test]
+    fn exclusive_writes_any_existing_store_and_never_creates_one() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(matches!(err_of(Writer::open(&d.path().join("nope"), mode(WriteMode::Exclusive))), StoreError::NotFound(_)));
+        assert!(!d.path().join("nope").exists());
+        assert!(matches!(err_of(Writer::open(d.path(), mode(WriteMode::Exclusive))), StoreError::NotFound(_)));
+
+        let mut w = Writer::open(d.path(), opts()).unwrap();
+        w.push(rec(1)).unwrap();
+        w.close().unwrap();
+        let mut w = Writer::open(d.path(), mode(WriteMode::Exclusive)).unwrap();
+        assert_eq!(w.push(rec(2)).unwrap(), 2);
+        w.close().unwrap();
+        // the manifest still says daemon; the new segment says exclusive; the daemon reads both
+        assert_eq!(Manifest::load(d.path()).unwrap().unwrap().origin, Origin::Daemon);
+        let s = Snapshot::open(d.path()).unwrap();
+        let kinds: Vec<_> = s.segments.iter().map(|h| h.header.writer).collect();
+        assert_eq!(kinds, vec![WriterKind::Daemon, WriterKind::Exclusive]);
+        let mut w = Writer::open(d.path(), opts()).unwrap();
+        assert_eq!(w.push(rec(3)).unwrap(), 3);
+        w.close().unwrap();
+    }
+
+    #[test]
+    fn newer_store_version_is_refused_by_readers_and_writers() {
+        let d = tempfile::tempdir().unwrap();
+        Writer::open(d.path(), opts()).unwrap().close().unwrap();
+        let mut m = Manifest::load(d.path()).unwrap().unwrap();
+        m.store_version = wartlog_store::manifest::STORE_VERSION + 1;
+        m.save(d.path()).unwrap();
+        assert!(matches!(err_of(Writer::open(d.path(), opts())), StoreError::NewerFormat(_)));
+        let e = Snapshot::open(d.path()).err().unwrap();
+        assert!(matches!(StoreError::find(&e), Some(StoreError::NewerFormat(_))));
+    }
+
+    #[test]
+    fn newer_segment_version_stops_the_writer() {
+        let d = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(d.path(), opts()).unwrap();
+        w.push(rec(1)).unwrap();
+        w.close().unwrap();
+        let p = wartlog_store::list_segments(d.path()).pop().unwrap();
+        let mut b = std::fs::read(&p).unwrap();
+        b[8] = 2;
+        let crc = crc32c::crc32c(&b[0..60]);
+        b[60..64].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&p, &b).unwrap();
+        assert!(matches!(err_of(Writer::open(d.path(), opts())), StoreError::NewerFormat(_)));
+        // a reader reports the segment and carries on
+        let s = Snapshot::open(d.path()).unwrap();
+        assert_eq!(s.errors.len(), 1);
+        assert!(s.errors[0].1.contains("unsupported segment version 2"), "{}", s.errors[0].1);
+    }
+
+    #[test]
+    fn adopt_command_turns_an_external_store_into_a_daemon_store() {
+        let d = tempfile::tempdir().unwrap();
+        Writer::open(d.path(), mode(WriteMode::Private)).unwrap().close().unwrap();
+        {
+            let _w = Writer::open(d.path(), mode(WriteMode::Private)).unwrap();
+            assert!(wartlog_store::manifest::adopt(d.path()).is_err(), "adopt must wait for the lock");
+        }
+        assert_eq!(wartlog_store::manifest::adopt(d.path()).unwrap().origin, Origin::Daemon);
+        Writer::open(d.path(), opts()).unwrap().close().unwrap();
+    }
+}
+
+mod verify {
+    use super::*;
+    use wartlog_store::verify::{verify_store, Finding, Options};
+
+    fn two_segments(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        for chunk in 0..2u64 {
+            let mut w = Writer::open(root, opts()).unwrap();
+            for i in 0..200 {
+                w.push(rec(chunk * 200 + i)).unwrap();
+            }
+            w.close().unwrap();
+        }
+        wartlog_store::list_segments(root)
+    }
+
+    #[test]
+    fn clean_store_passes() {
+        let d = tempfile::tempdir().unwrap();
+        two_segments(d.path());
+        // plus unsealed WAL records from a writer that has not closed
+        let mut w = Writer::open(d.path(), opts()).unwrap();
+        w.push(rec(1)).unwrap();
+        w.sync().unwrap();
+        let r = verify_store(d.path(), &Options::default());
+        assert!(r.ok(), "{:?}", r.findings);
+        assert_eq!((r.segments, r.records, r.wal_records), (2, 400, 1));
+        assert_eq!(r.writers, vec![(wartlog_store::WriterKind::Daemon, 2)]);
+        let q = verify_store(d.path(), &Options { full: false, ..Default::default() });
+        assert!(q.ok() && q.records == 0);
+    }
+
+    #[test]
+    fn copied_segment_is_duplicate_and_backwards() {
+        let d = tempfile::tempdir().unwrap();
+        let segs = two_segments(d.path());
+        // a copy of the first segment under a later name: same seqs again, after higher ones
+        let copy = segs[1].with_file_name("ffffffffffffffffffffffffffffffff.wseg");
+        std::fs::copy(&segs[0], &copy).unwrap();
+        let r = verify_store(d.path(), &Options::default());
+        assert!(r.findings.iter().any(|f| matches!(f, Finding::DuplicateSeq { .. })), "{:?}", r.findings);
+        assert!(r.findings.iter().any(|f| matches!(f, Finding::SeqBackwards { .. })));
+        assert!(r.findings.iter().any(|f| matches!(f, Finding::SealedAboveNewest { .. })));
+        // metadata-only mode still sees the order problems, not the duplicates
+        let q = verify_store(d.path(), &Options { full: false, ..Default::default() });
+        assert!(q.findings.iter().all(|f| !matches!(f, Finding::DuplicateSeq { .. })));
+        assert!(!q.ok());
+        assert!(r.findings.iter().all(|f| !f.describe().is_empty()));
+    }
+
+    #[test]
+    fn swapped_segments_seal_above_newest() {
+        let d = tempfile::tempdir().unwrap();
+        let segs = two_segments(d.path());
+        // swap contents: the older name now holds the higher seqs
+        let a = std::fs::read(&segs[0]).unwrap();
+        let b = std::fs::read(&segs[1]).unwrap();
+        for s in &segs {
+            let _ = std::fs::remove_file(tix::tix_path(s));
+        }
+        std::fs::write(&segs[0], b).unwrap();
+        std::fs::write(&segs[1], a).unwrap();
+        let r = verify_store(d.path(), &Options::default());
+        let f = r.findings.iter().find(|f| matches!(f, Finding::SealedAboveNewest { .. })).expect("finding");
+        if let Finding::SealedAboveNewest { max_seq, newest_max_seq, .. } = f {
+            assert_eq!((*max_seq, *newest_max_seq), (400, 200));
+        }
+    }
+
+    #[test]
+    fn hidden_wal_record_is_reported() {
+        let d = tempfile::tempdir().unwrap();
+        two_segments(d.path());
+        // a WAL record whose seq counts as sealed (below the older segment's max) but is in no segment
+        let mut wal = wartlog_store::wal::WalFile::create(d.path(), 1).unwrap();
+        let mut r = rec(7);
+        r.seq = 1_000_000;
+        wal.append(&r).unwrap();
+        let mut r = rec(8);
+        r.seq = 5; // present in a segment: fine
+        wal.append(&r).unwrap();
+        wal.sync().unwrap();
+        let rep = verify_store(d.path(), &Options::default());
+        assert!(rep.ok(), "seq above everything is simply unsealed: {:?}", rep.findings);
+        let mut r = rec(9);
+        r.seq = 0;
+        wal.append(&r).unwrap();
+        wal.sync().unwrap();
+        let rep = verify_store(d.path(), &Options::default());
+        assert_eq!(rep.findings, vec![Finding::HiddenWalRecord { seq: 0 }]);
+    }
+}

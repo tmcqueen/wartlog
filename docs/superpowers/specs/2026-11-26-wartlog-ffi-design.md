@@ -195,3 +195,24 @@ A single-file portable log (one segment with its index appended, for mailing or 
 5. `wartlog-ffi` with all three writer modes, the cbindgen header and C tests.
 6. The C# wrapper and a sample reader and writer.
 7. `docs/protocol.md`; Arrow output if bulk reads need it.
+
+## 12. Build notes (differences from the design above)
+
+Steps 1 and 2 (2026-11-26):
+
+- The manifest is binary, in the style of `sources.wcat` (layout in format.md), not TOML: the
+  store crate has no TOML dependency, and every other store file is CRC-checked binary.
+  `wl store info` prints it.
+- Exclusive mode never creates a store (`StoreError::NotFound`): it exists for daemon stores, and a
+  new store should be made in private mode or by wartlogd.
+- Ownership is checked before the lock, so a private writer on a daemon store gets "daemon store"
+  even while wartlogd holds the lock, instead of "locked".
+- A store without a manifest keeps having none: nothing writes one into an existing store.
+- Value tags: there was no length for an unknown tag, so a reader could not skip it. Tags 9 and up
+  are now reserved for types whose payload is a u32 string ref; a reader shows an unknown one as
+  the raw bytes. Any other payload width needs a new segment version.
+- `wl store verify` also checks seq order inside each block, and reports WAL records that count as
+  sealed but are in no segment (the records recovery would silently delete). `--quick` checks
+  block metadata only.
+- `wl status` shows the store origin and segment counts per writer kind; `wl index verify` shows
+  each segment's writer kind.

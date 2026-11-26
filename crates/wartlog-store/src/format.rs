@@ -104,11 +104,76 @@ impl<'a> Cursor<'a> {
 
 // ---------- segment header ----------
 
+/// Which kind of writer created a segment (header bytes 10..12). Informational only: nothing
+/// refuses a segment because of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WriterKind {
+    /// every segment written before the field existed
+    #[default]
+    Unknown,
+    Daemon,
+    /// the library, writing a store it owns
+    Private,
+    /// the library, writing a daemon store with the daemon stopped
+    Exclusive,
+    /// a value written by a newer version
+    Other(u16),
+}
+
+impl WriterKind {
+    pub fn code(self) -> u16 {
+        match self {
+            WriterKind::Unknown => 0,
+            WriterKind::Daemon => 1,
+            WriterKind::Private => 2,
+            WriterKind::Exclusive => 3,
+            WriterKind::Other(n) => n,
+        }
+    }
+
+    pub fn from_code(v: u16) -> WriterKind {
+        match v {
+            0 => WriterKind::Unknown,
+            1 => WriterKind::Daemon,
+            2 => WriterKind::Private,
+            3 => WriterKind::Exclusive,
+            n => WriterKind::Other(n),
+        }
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            WriterKind::Unknown => "unknown".into(),
+            WriterKind::Daemon => "daemon".into(),
+            WriterKind::Private => "private".into(),
+            WriterKind::Exclusive => "exclusive".into(),
+            WriterKind::Other(n) => format!("kind:{n}"),
+        }
+    }
+}
+
+/// A structure version newer than this build reads. Readers refuse it rather than guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedVersion {
+    pub what: &'static str,
+    pub version: u16,
+    pub supported: u16,
+}
+
+impl std::fmt::Display for UnsupportedVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unsupported {} version {} (this build reads up to {}); upgrade WartLog", self.what, self.version, self.supported)
+    }
+}
+
+impl std::error::Error for UnsupportedVersion {}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SegmentHeader {
     pub id: [u8; 16],
     pub prev: [u8; 16],
     pub created_ns: i64,
+    pub writer: WriterKind,
 }
 
 impl SegmentHeader {
@@ -116,7 +181,7 @@ impl SegmentHeader {
         let mut b = Vec::with_capacity(SEG_HEADER_LEN);
         b.extend_from_slice(SEG_MAGIC);
         put_u16(&mut b, SEG_VERSION);
-        put_u16(&mut b, 0);
+        put_u16(&mut b, self.writer.code());
         put_u32(&mut b, SEG_HEADER_LEN as u32);
         b.extend_from_slice(&self.id);
         b.extend_from_slice(&self.prev);
@@ -137,12 +202,13 @@ impl SegmentHeader {
         }
         let v = get_u16(b, 8);
         if v != SEG_VERSION {
-            bail!("unsupported segment version {v}");
+            return Err(UnsupportedVersion { what: "segment", version: v, supported: SEG_VERSION }.into());
         }
         Ok(SegmentHeader {
             id: b[16..32].try_into().unwrap(),
             prev: b[32..48].try_into().unwrap(),
             created_ns: get_i64(b, 48),
+            writer: WriterKind::from_code(get_u16(b, 10)),
         })
     }
 }
@@ -299,9 +365,20 @@ mod tests {
 
     #[test]
     fn headers_round_trip_and_reject_damage() {
-        let h = SegmentHeader { id: [7; 16], prev: [1; 16], created_ns: 42 };
+        let h = SegmentHeader { id: [7; 16], prev: [1; 16], created_ns: 42, writer: WriterKind::Exclusive };
         let mut b = h.encode();
+        assert_eq!(get_u16(&b, 10), 3);
         assert_eq!(SegmentHeader::decode(&b).unwrap(), h);
+        // an unknown writer kind still decodes (informational only)
+        let other = SegmentHeader { writer: WriterKind::Other(77), ..h.clone() };
+        assert_eq!(SegmentHeader::decode(&other.encode()).unwrap().writer, WriterKind::Other(77));
+        // a newer segment version is refused with a typed error
+        let mut newer = h.encode();
+        newer[8] = 2;
+        let crc = crc32c::crc32c(&newer[0..60]);
+        newer[60..64].copy_from_slice(&crc.to_le_bytes());
+        let e = SegmentHeader::decode(&newer).unwrap_err();
+        assert!(e.downcast_ref::<UnsupportedVersion>().is_some());
         b[20] ^= 1;
         assert!(SegmentHeader::decode(&b).is_err());
 

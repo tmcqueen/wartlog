@@ -14,6 +14,9 @@ struct Args {
     /// API socket (default: $XDG_RUNTIME_DIR/wartlog/api.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// write to an external store (one created by a library writer), marking it as a daemon store
+    #[arg(long)]
+    adopt: bool,
     /// print the default config and exit
     #[arg(long)]
     print_default_config: bool,
@@ -49,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         config_path: args.config.unwrap_or_else(wartlogd::config::default_path),
         store: args.store,
         api_socket: args.socket,
+        adopt: args.adopt,
         ..Default::default()
     };
     if let Err(e) = wartlogd::run(opts, rx).await {

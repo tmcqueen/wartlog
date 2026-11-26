@@ -2470,6 +2470,7 @@ dependencies = [
  "memmap2",
  "rayon",
  "tempfile",
+ "thiserror",
  "tracing",
  "uuid",
  "wartlog-model",
