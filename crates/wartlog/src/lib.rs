@@ -35,6 +35,7 @@ pub use error::{Error, ErrorKind, Result};
 pub use read::{record_json, QueryOptions, Row, Rows, Snapshot};
 pub use write::{WriteMode, Writer, WriterOptions};
 
+pub use wartlog_model::template;
 pub use wartlog_model::time::now_ns;
 pub use wartlog_model::{Kind, Record, Source, SourceKind, SpanData, Value};
 pub use wartlog_query::QueryStats;

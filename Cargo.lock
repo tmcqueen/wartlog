@@ -2426,6 +2426,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wartlog-ffi"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "wartlog",
+]
+
+[[package]]
 name = "wartlog-model"
 version = "0.1.0"
 dependencies = [
