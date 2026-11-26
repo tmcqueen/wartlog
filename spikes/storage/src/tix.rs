@@ -34,68 +34,89 @@ fn get_varint(b: &[u8], o: &mut usize) -> u64 {
     loop { let x = b[*o]; *o += 1; v |= ((x & 0x7f) as u64) << s; if x < 0x80 { return v; } s += 7; }
 }
 
-/// Builds the .wtix bytes for a segment by scanning and decoding it.
+/// Terms and field values of one block, extracted without materializing records.
+struct BlockTerms { entry: Vec<u8>, terms: Vec<Vec<u8>>, fields: Vec<(String, String)>, records: u64 }
+
+fn block_terms(f: &File, b: &BlockLoc) -> Result<BlockTerms> {
+    let p = read_payload(f, b)?;
+    let s = Summary::decode(&b.summary)?;
+    let mut entry = Vec::with_capacity(ENTRY);
+    put_u64(&mut entry, b.offset);
+    put_u32(&mut entry, b.compressed_len);
+    put_u32(&mut entry, b.uncompressed_len);
+    put_u32(&mut entry, b.record_count);
+    put_u32(&mut entry, b.payload_crc);
+    put_i64(&mut entry, s.min_time);
+    put_i64(&mut entry, s.max_time);
+    put_u32(&mut entry, s.severities);
+    put_u32(&mut entry, 0);
+    put_u64(&mut entry, s.first_seq);
+    // string table
+    let mut o = 0;
+    let n = get_u32(&p, o) as usize; o += 4;
+    let mut strings: Vec<&str> = Vec::with_capacity(n);
+    for _ in 0..n { let l = get_u32(&p, o) as usize; o += 4; strings.push(std::str::from_utf8(&p[o..o + l])?); o += l; }
+    let ns = get_u32(&p, o) as usize; o += 4;
+    for _ in 0..ns { o += 9; let na = get_u16(&p, o) as usize; o += 2 + na * 8; }
+    while o % 8 != 0 { o += 1; }
+    // walk records: collect distinct body refs and distinct (key, value) pairs
+    let mut bodies: HashSet<u32> = HashSet::new();
+    let mut pairs: HashSet<(u32, u8, u64)> = HashSet::new();
+    for _ in 0..b.record_count {
+        let len = get_u32(&p, o) as usize;
+        bodies.insert(get_u32(&p, o + 36));
+        let na = get_u16(&p, o + 32) as usize;
+        let mut q = o + RECORD_FIXED_LEN;
+        for _ in 0..na {
+            let k = get_u32(&p, q); let tag = p[q + 4]; q += 5;
+            let v = match tag { 1 => { q += 1; p[q - 1] as u64 } 2 | 3 => { q += 8; get_u64(&p, q - 8) } 4 => { q += 4; get_u32(&p, q - 4) as u64 } _ => 0 };
+            pairs.insert((k, tag, v));
+        }
+        o += len;
+    }
+    let mut terms: Vec<Vec<u8>> = Vec::new();
+    for r in bodies {
+        for t in tokens(strings[r as usize]) {
+            if t.chars().count() >= 3 { terms.push([b"t:".as_slice(), t.as_bytes()].concat()); }
+        }
+    }
+    terms.sort_unstable();
+    terms.dedup();
+    let fields = pairs.into_iter().filter_map(|(k, tag, v)| {
+        let val = match tag { 1 => (v != 0).to_string(), 2 => (v as i64).to_string(), 3 => f64::from_bits(v).to_string(), 4 => strings[v as usize].to_string(), _ => return None };
+        if val.len() > 64 { None } else { Some((strings[k as usize].to_string(), val)) }
+    }).collect();
+    Ok(BlockTerms { entry, terms, fields, records: b.record_count as u64 })
+}
+
+/// Builds the .wtix bytes for a segment by scanning it; blocks are processed in parallel.
 pub fn build(seg: &Path) -> Result<Vec<u8>> {
+    use rayon::prelude::*;
     let (id, len, rep) = scan_segment(seg, true)?;
     let f = File::open(seg)?;
+    let per_block: Vec<BlockTerms> = rep.blocks.par_iter().map(|b| block_terms(&f, b)).collect::<Result<_>>()?;
+    let records: u64 = per_block.iter().map(|b| b.records).sum();
+    // decide which fields are low-cardinality enough to index
+    let mut distinct: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for b in &per_block { for (k, v) in &b.fields { distinct.entry(k.as_str()).or_default().insert(v.as_str()); } }
+    let cap = (records / 10).max(1024) as usize;
+    let indexed: HashSet<&str> = distinct.iter().filter(|(_, s)| s.len() <= cap).map(|(k, _)| *k).collect();
+    // (term, block) pairs, sorted, grouped into postings
+    let mut pairs: Vec<(Vec<u8>, u32)> = Vec::new();
+    for (bi, b) in per_block.iter().enumerate() {
+        for t in &b.terms { pairs.push((t.clone(), bi as u32)); }
+        for (k, v) in &b.fields { if indexed.contains(k.as_str()) { pairs.push((format!("f:{k}\0{v}").into_bytes(), bi as u32)); } }
+    }
+    for k in &indexed { pairs.push((format!("k:{k}").into_bytes(), u32::MAX)); }
+    pairs.par_sort_unstable();
+    pairs.dedup();
     let mut terms: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
-    let mut distinct: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut high: HashSet<String> = HashSet::new();
-    let mut table = Vec::with_capacity(rep.blocks.len() * ENTRY);
-    let mut records = 0u64;
-    let mut add = |terms: &mut BTreeMap<Vec<u8>, Vec<u32>>, t: Vec<u8>, bi: u32| {
+    for (t, b) in pairs {
         let v = terms.entry(t).or_default();
-        if v.last() != Some(&bi) { v.push(bi); }
-    };
-    for (bi, b) in rep.blocks.iter().enumerate() {
-        let bi = bi as u32;
-        let p = read_payload(&f, b)?;
-        let recs = decode_payload(&p, b.record_count)?;
-        let s = Summary::decode(&b.summary)?;
-        put_u64(&mut table, b.offset);
-        put_u32(&mut table, b.compressed_len);
-        put_u32(&mut table, b.uncompressed_len);
-        put_u32(&mut table, b.record_count);
-        put_u32(&mut table, b.payload_crc);
-        put_i64(&mut table, s.min_time);
-        put_i64(&mut table, s.max_time);
-        put_u32(&mut table, s.severities);
-        put_u32(&mut table, 0);
-        put_u64(&mut table, s.first_seq);
-        for r in &recs {
-            records += 1;
-            for t in tokens(&r.body) {
-                if t.chars().count() >= 3 { add(&mut terms, [b"t:".as_slice(), t.as_bytes()].concat(), bi); }
-            }
-            for (k, v) in &r.attrs {
-                if high.contains(k) { continue; }
-                let v = v.as_display();
-                if v.len() > 64 { continue; }
-                let set = distinct.entry(k.clone()).or_default();
-                set.insert(v.clone());
-                add(&mut terms, format!("f:{k}\0{v}").into_bytes(), bi);
-            }
-        }
-        // drop fields that turn out to be high-cardinality (ids, timestamps)
-        let cap = (records / 10).max(1024) as usize;
-        let over: Vec<String> = distinct.iter().filter(|(_, s)| s.len() > cap).map(|(k, _)| k.clone()).collect();
-        for k in over {
-            distinct.remove(&k);
-            let prefix = format!("f:{k}\0").into_bytes();
-            let keys: Vec<Vec<u8>> = terms.range(prefix.clone()..).take_while(|(t, _)| t.starts_with(&prefix)).map(|(t, _)| t.clone()).collect();
-            for t in keys { terms.remove(&t); }
-            high.insert(k);
-        }
+        if b != u32::MAX { v.push(b); }
     }
-    let final_cap = (records / 10).max(1024) as usize;
-    for (k, s) in &distinct {
-        if s.len() <= final_cap { terms.insert(format!("k:{k}").into_bytes(), vec![]); }
-        else {
-            let prefix = format!("f:{k}\0").into_bytes();
-            let keys: Vec<Vec<u8>> = terms.range(prefix.clone()..).take_while(|(t, _)| t.starts_with(&prefix)).map(|(t, _)| t.clone()).collect();
-            for t in keys { terms.remove(&t); }
-        }
-    }
+    let mut table = Vec::with_capacity(per_block.len() * ENTRY);
+    for b in &per_block { table.extend_from_slice(&b.entry); }
     let mut postings = Vec::new();
     let mut fb = fst::MapBuilder::memory();
     for (t, blocks) in &terms {
