@@ -50,3 +50,4 @@ debug = 1
 [workspace.lints.clippy]
 manual_is_multiple_of = "allow"
 too_many_arguments = "allow"
+type_complexity = "allow"

@@ -675,7 +675,7 @@ pub fn run_query(q: &Query, snap: &Snapshot, opts: &QueryOptions) -> Result<Quer
             let mut i = 0;
             while i < cands.len() {
                 if rows.len() as u64 >= limit {
-                    rows.sort_by(|a, b| newest_first(a, b));
+                    rows.sort_by(newest_first);
                     rows.truncate(limit as usize);
                     let cutoff = rows.last().and_then(|r| r.rec.as_ref()).map(|r| r.time_ns).unwrap_or(i64::MIN);
                     if cands[i].2 < cutoff {

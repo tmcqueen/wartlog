@@ -115,7 +115,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, QueryError> {
                 '!' if at(i + 1).is_some_and(is_ident_start) => {
                     // !has, !contains, !in, !between, ...
                     let mut j = i + 1;
-                    while j < b.len() && (is_ident(b[j].1) || (b[j].1 == '~' && j == j)) {
+                    while j < b.len() && is_ident(b[j].1) {
                         j += 1;
                     }
                     if at(j) == Some('~') {
