@@ -154,6 +154,8 @@ pub enum Response {
     /// `start`/`end` point into the KQL text when the error is about it
     Error { message: String, start: Option<usize>, end: Option<usize> },
     Rows { table: Table },
+    /// live tail only: the client fell behind and `missed` records were skipped
+    Lagged { missed: u64 },
     Done { stats: QueryStats },
     Sources { configured: Vec<SourceInfo>, seen: Vec<SeenSource> },
     Schema { schema: Schema },
@@ -175,9 +177,9 @@ impl Response {
         Response::Error { message: e.message.clone(), start: has_span.then_some(e.start), end: has_span.then_some(e.end) }
     }
 
-    /// True for the last message of a reply (everything but `Rows`).
+    /// True for the last message of a reply (everything but `Rows` and `Lagged`).
     pub fn is_final(&self) -> bool {
-        !matches!(self, Response::Rows { .. })
+        !matches!(self, Response::Rows { .. } | Response::Lagged { .. })
     }
 }
 

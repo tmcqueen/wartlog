@@ -6,7 +6,7 @@ members = [
     "crates/wartlog-query",
     "crates/wartlog-sources",
     "crates/wartlog-api",
-    # "crates/wartlogd",
+    "crates/wartlogd",
     # "crates/wartlog-cli",
 ]
 # The viewer needs Qt 6 and is built on its own: cargo build -p wartlog-viewer (see crates/wartlog-viewer/README.md)
