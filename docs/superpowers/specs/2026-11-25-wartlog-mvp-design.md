@@ -413,7 +413,7 @@ The API carries what only a running daemon knows: live tail, records still in th
 
 
 - Transport: stream UNIX socket at `$XDG_RUNTIME_DIR/wartlog/api.sock`, directory mode 0700.
-- Framing: `u32` length plus a CBOR-encoded message (CBOR is a binary format shaped like JSON) (serde). The first exchange is a version handshake.
+- Framing: `u32` length plus a CBOR-encoded message, serialized with serde (CBOR is a binary format shaped like JSON). The first exchange is a version handshake.
 - Requests:
   - `query { kql, time_range, limit, order }` returns a stream of row batches, then stats (blocks considered, pruned, scanned, rows, elapsed).
   - `tail { kql, backfill }` returns a stream that stays open.
