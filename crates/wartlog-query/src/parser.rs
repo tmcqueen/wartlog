@@ -28,7 +28,7 @@ pub fn parse_expr(src: &str) -> Result<Expr, QueryError> {
     Ok(e)
 }
 
-const OPERATORS: &[&str] = &["where", "filter", "project", "project-away", "extend", "take", "limit", "sort", "order", "top", "summarize", "distinct", "count", "search"];
+pub const OPERATORS: &[&str] = &["where", "filter", "project", "project-away", "extend", "take", "limit", "sort", "order", "top", "summarize", "distinct", "count", "search"];
 
 const UNSUPPORTED: &[&str] = &[
     "join", "let", "union", "make-series", "render", "materialize", "mv-expand", "parse", "evaluate", "lookup", "as", "invoke", "project-keep",
