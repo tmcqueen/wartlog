@@ -1,0 +1,13 @@
+[package]
+name = "sqlite-compare"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "THROWAWAY: loads journalctl JSON into SQLite and times the same queries as wl-spike."
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"

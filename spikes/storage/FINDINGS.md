@@ -38,3 +38,25 @@ Every query returned the same rows from both tools.
 ## Not tested
 
 The WAL and crash recovery, cold-cache runs (needs sudo), many segments, concurrent ingest and query, templates, traces.
+
+## Head-to-head with SQLite (2M synthetic entries, cloud box, 4 CPUs)
+
+SQLite (bundled 3.x through rusqlite) uses one `logs` table with promoted columns (time, severity, unit, message) and the remaining fields as a JSON text column. It has B-tree indexes on `time`, `(unit, time)` and `(severity, time)`, plus an FTS5 index on `message`. Both loaders are Rust with the same serde_json parsing (`spikes/sqlite-compare`). SQLite times are measured in-process. WartLog times include process start and about 10 ms spent loading 2,000 block summaries, which a long-running daemon would keep in memory.
+
+| | SQLite | WartLog | WartLog, 1 thread |
+|---|---|---|---|
+| On disk | 1.24 GB (1.16 GB without FTS) | 84 MB | |
+| Load | 11.7 s insert + 3.0 s B-trees + 5.2 s FTS = 19.9 s | 15.9 s | |
+| Rare term (`MATCH` vs `has`) | <0.1 ms | 16 ms | 16 ms |
+| Substring (`LIKE` vs `contains`) | 420 ms | 121 ms | 446 ms |
+| Unit + time window | 6 ms | 33 ms | 68 ms |
+| Unit, whole log | 61 ms | 151 ms | 541 ms |
+| Errors and worse | 327 ms | 147 ms | 465 ms |
+| Everything in a time window (200k rows) | 373 ms | 299 ms | 753 ms |
+
+Takeaways:
+
+- **SQLite wins exact lookups.** A real inverted index (FTS5) and B-trees beat per-block Bloom filters and summaries for point queries. WartLog's wins on broad scans come mostly from parallelism; on one thread it loses most rows.
+- **WartLog wins on size by 15x**, which matters for retention: 10 GiB of WartLog holds about as much as 150 GiB of this SQLite layout. It also keeps damage local and has indexes that can be thrown away and rebuilt.
+- **SQLite's load numbers are flattering.** Its indexes were built in bulk after the insert. A live sink maintains them on every insert, which costs more.
+- **Idea worth testing:** because WartLog's indexes are disposable, they could use real inverted structures, either our own (term to block list per segment) or SQLite itself as the index store over our segments. That would combine compact, durable segments with point lookups below a millisecond.
