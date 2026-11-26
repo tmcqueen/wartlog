@@ -34,10 +34,12 @@ fn get_varint(b: &[u8], o: &mut usize) -> u64 {
     loop { let x = b[*o]; *o += 1; v |= ((x & 0x7f) as u64) << s; if x < 0x80 { return v; } s += 7; }
 }
 
-/// Terms and field values of one block, extracted without materializing records.
-struct BlockTerms { entry: Vec<u8>, terms: Vec<Vec<u8>>, fields: Vec<(String, String)>, records: u64 }
+/// Terms of one block, extracted from its string table without materializing records.
+/// Pass 1 (`indexed` = None) returns per-key hashes of distinct values, so cardinality can be judged in bounded memory.
+/// Pass 2 returns the `f:` terms of the indexed keys only.
+struct BlockTerms { entry: Vec<u8>, terms: Vec<Vec<u8>>, key_values: Vec<(String, Vec<u64>)> }
 
-fn block_terms(f: &File, b: &BlockLoc) -> Result<BlockTerms> {
+fn block_terms(f: &File, b: &BlockLoc, indexed: Option<&HashSet<String>>) -> Result<BlockTerms> {
     let p = read_payload(f, b)?;
     let s = Summary::decode(&b.summary)?;
     let mut entry = Vec::with_capacity(ENTRY);
@@ -74,39 +76,72 @@ fn block_terms(f: &File, b: &BlockLoc) -> Result<BlockTerms> {
         }
         o += len;
     }
+    let show = |tag: u8, v: u64| -> Option<String> {
+        Some(match tag { 1 => (v != 0).to_string(), 2 => (v as i64).to_string(), 3 => f64::from_bits(v).to_string(), 4 => strings[v as usize].to_string(), _ => return None })
+    };
     let mut terms: Vec<Vec<u8>> = Vec::new();
-    for r in bodies {
-        for t in tokens(strings[r as usize]) {
-            if t.chars().count() >= 3 { terms.push([b"t:".as_slice(), t.as_bytes()].concat()); }
+    let mut key_values = Vec::new();
+    match indexed {
+        None => {
+            for r in bodies {
+                for t in tokens(strings[r as usize]) {
+                    if t.chars().count() >= 3 { terms.push([b"t:".as_slice(), t.as_bytes()].concat()); }
+                }
+            }
+            let mut by_key: HashMap<u32, Vec<u64>> = HashMap::new();
+            for (k, tag, v) in pairs {
+                let h = if tag == 4 { hash(strings[v as usize].as_bytes()) } else { hash(&[&[tag][..], &v.to_le_bytes()].concat()) };
+                by_key.entry(k).or_default().push(h);
+            }
+            key_values = by_key.into_iter().map(|(k, v)| (strings[k as usize].to_string(), v)).collect();
+        }
+        Some(ix) => {
+            for (k, tag, v) in pairs {
+                let key = strings[k as usize];
+                if !ix.contains(key) { continue; }
+                if let Some(val) = show(tag, v) { if val.len() <= 64 { terms.push(format!("f:{key}\0{val}").into_bytes()); } }
+            }
         }
     }
     terms.sort_unstable();
     terms.dedup();
-    let fields = pairs.into_iter().filter_map(|(k, tag, v)| {
-        let val = match tag { 1 => (v != 0).to_string(), 2 => (v as i64).to_string(), 3 => f64::from_bits(v).to_string(), 4 => strings[v as usize].to_string(), _ => return None };
-        if val.len() > 64 { None } else { Some((strings[k as usize].to_string(), val)) }
-    }).collect();
-    Ok(BlockTerms { entry, terms, fields, records: b.record_count as u64 })
+    Ok(BlockTerms { entry, terms, key_values })
 }
 
-/// Builds the .wtix bytes for a segment by scanning it; blocks are processed in parallel.
+/// Builds the .wtix bytes for a segment by scanning it; blocks are processed in parallel, in two passes
+/// (body terms and field cardinality, then field terms) so memory stays bounded by the indexed terms.
 pub fn build(seg: &Path) -> Result<Vec<u8>> {
     use rayon::prelude::*;
     let (id, len, rep) = scan_segment(seg, true)?;
     let f = File::open(seg)?;
-    let per_block: Vec<BlockTerms> = rep.blocks.par_iter().map(|b| block_terms(&f, b)).collect::<Result<_>>()?;
-    let records: u64 = per_block.iter().map(|b| b.records).sum();
-    // decide which fields are low-cardinality enough to index
-    let mut distinct: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for b in &per_block { for (k, v) in &b.fields { distinct.entry(k.as_str()).or_default().insert(v.as_str()); } }
+    let records: u64 = rep.blocks.iter().map(|b| b.record_count as u64).sum();
     let cap = (records / 10).max(1024) as usize;
-    let indexed: HashSet<&str> = distinct.iter().filter(|(_, s)| s.len() <= cap).map(|(k, _)| *k).collect();
-    // (term, block) pairs, sorted, grouped into postings
+    // pass 1: body terms, block table, and distinct-value counts per key (a key is dropped once it passes cap)
+    type Card = HashMap<String, Option<HashSet<u64>>>;
+    let merge = |mut a: Card, k: String, vals: Vec<u64>| -> Card {
+        let e = a.entry(k).or_insert_with(|| Some(HashSet::new()));
+        if let Some(set) = e { set.extend(vals); if set.len() > cap { *e = None; } }
+        a
+    };
+    let pass1: Vec<(Vec<u8>, Vec<Vec<u8>>, Card)> = rep.blocks.par_iter().map(|b| {
+        let bt = block_terms(&f, b, None)?;
+        let card = bt.key_values.into_iter().fold(Card::new(), |a, (k, v)| merge(a, k, v));
+        Ok((bt.entry, bt.terms, card))
+    }).collect::<Result<_>>()?;
+    let mut card = Card::new();
+    let mut table = Vec::with_capacity(pass1.len() * ENTRY);
     let mut pairs: Vec<(Vec<u8>, u32)> = Vec::new();
-    for (bi, b) in per_block.iter().enumerate() {
-        for t in &b.terms { pairs.push((t.clone(), bi as u32)); }
-        for (k, v) in &b.fields { if indexed.contains(k.as_str()) { pairs.push((format!("f:{k}\0{v}").into_bytes(), bi as u32)); } }
+    for (bi, (entry, terms, c)) in pass1.into_iter().enumerate() {
+        table.extend_from_slice(&entry);
+        for t in terms { pairs.push((t, bi as u32)); }
+        for (k, v) in c {
+            match v { Some(set) => card = merge(card, k, set.into_iter().collect()), None => { card.insert(k, None); } }
+        }
     }
+    let indexed: HashSet<String> = card.into_iter().filter(|(_, s)| s.is_some()).map(|(k, _)| k).collect();
+    // pass 2: field terms of the indexed keys
+    let fields: Vec<Vec<Vec<u8>>> = rep.blocks.par_iter().map(|b| Ok(block_terms(&f, b, Some(&indexed))?.terms)).collect::<Result<_>>()?;
+    for (bi, ts) in fields.into_iter().enumerate() { for t in ts { pairs.push((t, bi as u32)); } }
     for k in &indexed { pairs.push((format!("k:{k}").into_bytes(), u32::MAX)); }
     pairs.par_sort_unstable();
     pairs.dedup();
@@ -115,8 +150,6 @@ pub fn build(seg: &Path) -> Result<Vec<u8>> {
         let v = terms.entry(t).or_default();
         if b != u32::MAX { v.push(b); }
     }
-    let mut table = Vec::with_capacity(per_block.len() * ENTRY);
-    for b in &per_block { table.extend_from_slice(&b.entry); }
     let mut postings = Vec::new();
     let mut fb = fst::MapBuilder::memory();
     for (t, blocks) in &terms {
