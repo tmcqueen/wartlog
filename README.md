@@ -43,44 +43,61 @@ the Aspire dashboard (`forward = [...]` in the config).
 
 ## How it compares
 
-These numbers come from the storage spike (`spikes/storage`, full write-up in
-[FINDINGS.md](spikes/storage/FINDINGS.md)), which prototyped the design the store now uses: per-source
-blocks, a term index per segment, no Bloom filters. They have not been re-measured with the shipped
-`wartlogd` and `wl` yet. Each comparison returned the same rows from both tools.
+Measured with the shipped `wartlogd` and `wl` (release build) on one desktop: a 10-core,
+20-thread Xeon E5-2660 v3 with 125 GB of RAM and a SATA SSD, warm page cache. Data goes in through
+the daemon's own paths: `wl send` into the NDJSON receiver, and the journald collector. Every
+WartLog time is a fresh `wl query --json` process printing each matching row, median of 5; an
+empty result costs about 14 ms (30 ms on the big store) for process start and opening the store.
+The DuckDB and journald runs returned identical rows from both tools (compared by event id and
+timestamp); the SQLite runs returned the same row counts.
 
-**Against SQLite** (2 million synthetic journal entries, 4 CPUs, in-process, median of 5). SQLite has
-B-tree indexes on time, unit and severity, plus FTS5 on the message.
+**Against SQLite** (2 million synthetic journal entries). SQLite has B-tree indexes on time, unit
+and severity, plus FTS5 on the message. Its times are in-process with no startup cost.
 
 | | SQLite + FTS5 | WartLog |
 |---|---|---|
-| On disk | 1.24 GB | 74 MB |
-| Rare term | <0.05 ms | 0.9 ms |
-| Unit + time window (1,952 rows) | 5.7 ms | 3.3 ms |
-| Unit, whole log (20k rows) | 61 ms | 20 ms |
-| Errors and worse (40k rows) | 327 ms | 96 ms |
-| Everything in a time window (200k rows) | 373 ms | 180 ms |
-| Substring (`LIKE` / `contains`) | 420 ms | 81 ms |
+| On disk | 1.24 GB | 103 MB |
+| Load | 43 s (insert, then indexes in bulk) | 83 s (24k records/s through `wl send`) |
+| Rare term | <0.05 ms | 14 ms |
+| Substring (`LIKE` / `contains`) | 859 ms | 157 ms |
+| Unit + time window (1,952 rows) | 11 ms | 89 ms |
+| Unit, whole log (20k rows) | 119 ms | 757 ms |
+| Errors and worse (40k rows) | 792 ms | 1.59 s |
+| Everything in a time window (200k rows) | 755 ms | 8.35 s |
 
-SQLite still wins exact term lookups, by under a millisecond. WartLog's broad scans lean on
-parallelism; on one thread it roughly ties SQLite on unit lookups and loses the large scans.
+WartLog is 12x smaller and wins substring search. SQLite wins every indexed lookup, and the gap
+grows with the number of rows returned: WartLog spends about 25 to 40 µs per printed row.
 
-**Against DuckDB on Parquet** (117 million events from a real dataset, 4 CPUs, fresh processes
-printing every row, median of 5)
+**Against DuckDB on Parquet** (117 million ride events from a real theme park dataset). Both sides
+are fresh processes printing every row as JSON.
 
 | | DuckDB 2.0.1 | WartLog |
 |---|---|---|
-| On disk | 858 MB | 1.45 GB |
-| One guest's events (34 rows) | 288 ms | 11 ms |
-| One attraction, one day | 96 ms | 9 ms |
-| One attraction, all years (792k rows) | 4.18 s | 1.49 s |
-| Broad scans across a whole year | faster by about 1.5x | |
+| On disk | 858 MB | 2.03 GB |
+| Load | none (queries the files) | 30 min (65k records/s through `wl send`) |
+| One guest's rides (34 rows) | 219 ms | 37 ms |
+| One attraction, one day (286 rows) | 139 ms | 38 ms |
+| One attraction, one year (109k rows) | 347 ms | 2.99 s |
+| One attraction, all years (792k rows) | 1.40 s | 21.2 s |
 
-DuckDB has no index for a random id, so point lookups favor WartLog by 7 to 25x; columnar
-execution wins whole-table scans, and Parquet is still 1.7x smaller.
+DuckDB has no index for a random id, so point lookups favor WartLog by 4 to 6x. Anything that
+returns many rows favors DuckDB by 9 to 15x, and Parquet is 2.4x smaller.
 
-**Against journald** (a real desktop user journal, 65k entries): 71 MB on disk for journald vs 2.5 MB for
-WartLog, and a rare-term search in 10 ms vs 239 ms for `journalctl -g`. At this size both tools
-answer field lookups instantly.
+**Against journald** (a real desktop user journal, 2.14 million entries; `journalctl` is a fresh
+process printing JSON). The collector read the whole journal in 171 s.
+
+| | journald | WartLog |
+|---|---|---|
+| On disk | 962 MB | 58 MB |
+| Rare term (`-g` / `has`, 6 rows) | 7.63 s | 15 ms |
+| Substring (`-g` / `contains`) | 7.72 s | 164 ms |
+| Unit + time window (9,144 rows) | 707 ms | 422 ms |
+| Unit, whole journal (22k rows) | 1.80 s | 1.27 s |
+| Errors and worse (`-p 3`, 6,172 rows) | 549 ms | 395 ms |
+| Everything in a time window (214k rows) | 18.9 s | 11.8 s |
+
+Known problems these runs found: `logs | count` holds every record in memory (it reached 120 GB on
+the 117M store), and wartlogd's resident memory grew to 15 GB during the 117M load.
 
 ## Workspace
 
