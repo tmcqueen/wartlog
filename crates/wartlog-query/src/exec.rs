@@ -38,6 +38,9 @@ pub struct QueryStats {
     pub elapsed_ms: f64,
     pub used_term_index: usize,
     pub truncated: bool,
+    /// blocks a count answered from block metadata without reading them
+    #[serde(default)]
+    pub blocks_from_metadata: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -146,8 +149,6 @@ pub struct Plan {
     sev_mask: u32,
     sources: Option<HashSet<u64>>,
     reqs: Vec<Req>,
-    limit: Option<u64>,
-    default_order: bool,
     now: i64,
 }
 
@@ -269,7 +270,7 @@ pub fn plan(q: &Query, snap: &Snapshot, opts: &QueryOptions) -> Result<Plan, Que
         i += 1;
     }
     let rest: Vec<Op> = q.ops[i..].to_vec();
-    let mut p = Plan { table: q.table, filters: Vec::new(), rest, time: (None, None), sev_mask: u32::MAX, sources: None, reqs: Vec::new(), limit: None, default_order: false, now };
+    let mut p = Plan { table: q.table, filters: Vec::new(), rest, time: (None, None), sev_mask: u32::MAX, sources: None, reqs: Vec::new(), now };
 
     let source_keys: HashSet<&str> = snap.catalog.sources.values().flat_map(|s| s.attrs.iter().map(|(k, _)| k.as_str())).collect();
     let mut has_time = false;
@@ -315,14 +316,6 @@ pub fn plan(q: &Query, snap: &Snapshot, opts: &QueryOptions) -> Result<Plan, Que
         // nothing extra: blocks without spans are skipped by span_count
     }
     p.filters = filters;
-    // early-stop limit and default order
-    let orders = p.rest.iter().any(|o| matches!(o, Op::Sort(_) | Op::Top(..) | Op::Summarize { .. } | Op::Distinct(_) | Op::Count));
-    p.default_order = !orders;
-    match p.rest.as_slice() {
-        [] => p.limit = opts.limit,
-        [Op::Take(n)] => p.limit = Some(opts.limit.map_or(*n, |l| l.min(*n))),
-        _ => {}
-    }
     Ok(p)
 }
 
@@ -604,17 +597,199 @@ fn pool(threads: Option<usize>) -> Arc<rayon::ThreadPool> {
 }
 
 // ---------- execution ----------
+//
+// The operators after the leading filters split into three parts:
+//   stream: leading where/search/project/project-away/extend, applied to each record during the scan
+//   sink:   the first operator that needs more than one row (count, summarize, top, sort | take,
+//           distinct, take), folded per scan thread and merged, so memory follows the size of the
+//           result and not the number of records scanned
+//   tail:   whatever follows, applied to the sink's (small) output
+// Only a sort without a row cap still has to hold every matching row.
 
 pub fn run(src: &str, snap: &Snapshot, opts: &QueryOptions) -> Result<QueryResult, QueryError> {
     let q = crate::parser::parse(src)?;
     run_query(&q, snap, opts)
 }
 
+enum SinkSpec {
+    /// keep every row; when `newest` is set, newest first and capped at `limit`
+    Collect { limit: Option<u64>, newest: bool },
+    Count,
+    Summarize { aggs: Vec<(String, Agg)>, by: Vec<(String, Expr)> },
+    /// the first `n` rows by `keys`; `cap` marks a sort that is only bounded by the row cap
+    Top { keys: Vec<SortKey>, n: u64, cap: bool },
+    Distinct(Vec<(String, Expr)>),
+}
+
+struct Pipeline {
+    stream: Vec<Op>,
+    sink: SinkSpec,
+    tail: Vec<Op>,
+}
+
+impl Pipeline {
+    fn new(rest: &[Op], cap: Option<u64>) -> Pipeline {
+        let k = rest.iter().take_while(|o| o.is_streaming()).count();
+        let after = &rest[k..];
+        let (sink, used) = match after {
+            [] => (SinkSpec::Collect { limit: cap, newest: true }, 0),
+            [Op::Take(n), more @ ..] => {
+                let cap = if more.is_empty() { cap } else { None };
+                (SinkSpec::Collect { limit: Some(cap.map_or(*n, |l| l.min(*n))), newest: true }, 1)
+            }
+            [Op::Count, ..] => (SinkSpec::Count, 1),
+            [Op::Summarize { aggs, by }, ..] => (SinkSpec::Summarize { aggs: aggs.clone(), by: by.clone() }, 1),
+            [Op::Top(n, key), ..] => (SinkSpec::Top { keys: vec![key.clone()], n: *n, cap: false }, 1),
+            [Op::Sort(keys), Op::Take(n), ..] => (SinkSpec::Top { keys: keys.clone(), n: *n, cap: false }, 2),
+            [Op::Sort(keys)] if cap.is_some() => (SinkSpec::Top { keys: keys.clone(), n: cap.unwrap_or(0), cap: true }, 1),
+            [Op::Distinct(items), ..] => (SinkSpec::Distinct(items.clone()), 1),
+            _ => (SinkSpec::Collect { limit: None, newest: false }, 0),
+        };
+        Pipeline { stream: rest[..k].to_vec(), sink, tail: after[used..].to_vec() }
+    }
+
+    /// True when the stream cannot drop rows, so a count can come from block metadata.
+    fn stream_keeps_all(&self) -> bool {
+        self.stream.iter().all(|o| !matches!(o, Op::Where(_) | Op::Search(_)))
+    }
+}
+
+/// (time, seq) of a row's record: newest first is descending order of this.
+fn age_key(r: &Row) -> (i64, u64) {
+    r.rec.as_ref().map(|x| (x.time_ns, x.seq)).unwrap_or((i64::MIN, 0))
+}
+
+/// A scan thread's partial result.
+enum Acc<'p> {
+    Rows(Vec<Row>),
+    Count(u64),
+    Groups(Groups<'p>),
+    Top(TopN<'p>),
+    Distinct(DistinctAcc<'p>),
+}
+
+impl<'p> Acc<'p> {
+    fn new(s: &'p SinkSpec) -> Acc<'p> {
+        match s {
+            SinkSpec::Collect { .. } => Acc::Rows(Vec::new()),
+            SinkSpec::Count => Acc::Count(0),
+            SinkSpec::Summarize { aggs, by } => Acc::Groups(Groups::new(aggs, by)),
+            SinkSpec::Top { keys, n, .. } => Acc::Top(TopN::new(keys, *n as usize)),
+            SinkSpec::Distinct(items) => Acc::Distinct(DistinctAcc { items, seen: HashSet::new(), out: Vec::new() }),
+        }
+    }
+
+    /// Adds one matching row. `make` builds the row only for sinks that keep it.
+    fn push(&mut self, f: &dyn Fields, age: (i64, u64), make: impl FnOnce() -> Row, cx: &Ctx) {
+        match self {
+            Acc::Rows(v) => v.push(make()),
+            Acc::Count(n) => *n += 1,
+            Acc::Groups(g) => g.add(f, cx),
+            Acc::Top(t) => t.push(f, age, make, cx),
+            Acc::Distinct(d) => d.push(f, cx),
+        }
+    }
+
+    fn push_row(&mut self, r: Row, cx: &Ctx) {
+        let age = age_key(&r);
+        self.push(&r, age, || r.clone(), cx);
+    }
+
+    /// Combines two partial results; `self` comes first in scan order.
+    fn merge(self, other: Acc<'p>) -> Acc<'p> {
+        match (self, other) {
+            (Acc::Rows(mut a), Acc::Rows(b)) => {
+                a.extend(b);
+                Acc::Rows(a)
+            }
+            (Acc::Count(a), Acc::Count(b)) => Acc::Count(a + b),
+            (Acc::Groups(mut a), Acc::Groups(b)) => {
+                a.merge(b);
+                Acc::Groups(a)
+            }
+            (Acc::Top(mut a), Acc::Top(b)) => {
+                a.merge(b);
+                Acc::Top(a)
+            }
+            (Acc::Distinct(mut a), Acc::Distinct(b)) => {
+                a.merge(b);
+                Acc::Distinct(a)
+            }
+            (a, _) => a,
+        }
+    }
+}
+
+/// Applies streaming operators to one row; None when a filter drops it.
+fn stream_row(ops: &[Op], mut r: Row, cx: &Ctx, t: Table) -> Option<Row> {
+    for op in ops {
+        r = stream_op(op, r, cx, t)?;
+    }
+    Some(r)
+}
+
+fn stream_op(op: &Op, mut r: Row, cx: &Ctx, t: Table) -> Option<Row> {
+    match op {
+        Op::Where(e) => truthy(&eval(e, &r, cx)).then_some(r),
+        Op::Search(s) => {
+            let ok = match (&r.rec, r.projected) {
+                (Some(rec), false) => search_match(rec.as_ref(), &rec.rendered_body(), s),
+                _ => r.cols.iter().any(|(_, v)| eval::has(&v.to_text(), s, false)),
+            };
+            ok.then_some(r)
+        }
+        Op::Project(items) => {
+            let cols = items.iter().map(|(n, e)| (n.clone(), eval(e, &r, cx))).collect();
+            Some(Row { rec: r.rec, cols, projected: true })
+        }
+        Op::ProjectAway(names) => {
+            let cols = materialize(&r, t).into_iter().filter(|(n, _)| !names.contains(n)).collect();
+            Some(Row { rec: r.rec, cols, projected: true })
+        }
+        Op::Extend(items) => {
+            for (n, e) in items {
+                let v = eval(e, &r, cx);
+                r.cols.retain(|(k, _)| k != n);
+                r.cols.push((n.clone(), v));
+            }
+            Some(r)
+        }
+        _ => Some(r),
+    }
+}
+
+impl Plan {
+    /// How many of this block's records the query keeps, when the block metadata alone answers
+    /// it: no record-level filter and the block wholly inside the time, severity and source limits.
+    fn count_from_meta(&self, b: &BlockMeta) -> Option<u64> {
+        if !self.filters.is_empty() {
+            return None;
+        }
+        if self.time.0.is_some_and(|a| b.min_time < a) || self.time.1.is_some_and(|z| b.max_time > z) {
+            return None;
+        }
+        if b.severities & !self.sev_mask != 0 {
+            return None;
+        }
+        if let Some(allowed) = &self.sources {
+            if b.sources.is_empty() || !b.sources.iter().all(|s| allowed.contains(s)) {
+                return None;
+            }
+        }
+        Some(match self.table {
+            Table::Logs => b.record_count.saturating_sub(b.span_count) as u64,
+            Table::Spans => b.span_count as u64,
+        })
+    }
+}
+
 pub fn run_query(q: &Query, snap: &Snapshot, opts: &QueryOptions) -> Result<QueryResult, QueryError> {
     let start = Instant::now();
     let p = plan(q, snap, opts)?;
+    let pipe = Pipeline::new(&p.rest, opts.limit);
     let mut stats = QueryStats { segments: snap.segments.len(), ..Default::default() };
     let cancel = opts.cancel.clone().unwrap_or_default();
+    let cx = Ctx { now: p.now };
 
     // candidate blocks, newest first
     let mut cands: Vec<(usize, usize, i64)> = Vec::new();
@@ -625,52 +800,70 @@ pub fn run_query(q: &Query, snap: &Snapshot, opts: &QueryOptions) -> Result<Quer
         stats.blocks += seg.blocks.len() as u64;
         cands.extend(c.into_iter().map(|bi| (si, bi, seg.blocks[bi].max_time)));
     }
-    cands.sort_by(|a, b| b.2.cmp(&a.2));
+    cands.sort_by_key(|c| std::cmp::Reverse(c.2));
     stats.blocks_scanned = cands.len() as u64;
     stats.blocks_pruned = stats.blocks - stats.blocks_scanned;
 
     // WAL records
-    let mut rows: Vec<Row> = Vec::new();
+    let mut acc = Acc::new(&pipe.sink);
     for r in &snap.wal {
         let body = || r.rendered_body();
         let row = Row { rec: Some(Arc::new(r.clone())), cols: vec![], projected: false };
         if p.record_ok(r, &row, &body) {
-            rows.push(row);
+            if let Some(row) = stream_row(&pipe.stream, row, &cx, p.table) {
+                acc.push_row(row, &cx);
+            }
         }
     }
     stats.wal_records = snap.wal.len() as u64;
 
     let scanned = AtomicU64::new(0);
     let damaged = AtomicU64::new(0);
+    let from_meta = AtomicU64::new(0);
+    let meta_count = matches!(pipe.sink, SinkSpec::Count) && pipe.stream_keeps_all();
     let pool = pool(opts.threads);
-    let scan_block = |&(si, bi, _): &(usize, usize, i64)| -> Vec<Row> {
+    let scan_block = scanner(|mut acc: Acc, &(si, bi, _): &(usize, usize, i64)| {
         if cancel.load(AtomicOrdering::Relaxed) {
-            return vec![];
+            return acc;
         }
         let seg = &snap.segments[si];
+        if meta_count {
+            if let (Acc::Count(n), Some(c)) = (&mut acc, p.count_from_meta(&seg.blocks[bi])) {
+                *n += c;
+                from_meta.fetch_add(1, AtomicOrdering::Relaxed);
+                return acc;
+            }
+        }
         let v = match seg.read_block(bi) {
             Ok(v) => v,
             Err(_) => {
                 damaged.fetch_add(1, AtomicOrdering::Relaxed);
-                return vec![];
+                return acc;
             }
         };
         scanned.fetch_add(v.len() as u64, AtomicOrdering::Relaxed);
-        let mut out = Vec::new();
         for r in v.iter() {
             let f = RecFields { r, body: Default::default() };
             let body = || f.body.get_or_init(|| f.r.body()).clone();
-            if p.record_ok(&r, &f, &body) {
-                out.push(Row { rec: Some(Arc::new(r.to_record())), cols: vec![], projected: false });
+            if !p.record_ok(&r, &f, &body) {
+                continue;
+            }
+            let make = || Row { rec: Some(Arc::new(r.to_record())), cols: vec![], projected: false };
+            if pipe.stream.is_empty() {
+                acc.push(&f, (r.time(), r.seq()), make, &cx);
+            } else if let Some(row) = stream_row(&pipe.stream, make(), &cx, p.table) {
+                acc.push_row(row, &cx);
             }
         }
-        out
-    };
+        acc
+    });
+    let fold = |part: &[(usize, usize, i64)]| -> Acc<'_> { pool.install(|| part.par_iter().fold(|| Acc::new(&pipe.sink), scan_block).reduce(|| Acc::new(&pipe.sink), Acc::merge)) };
 
-    match p.limit {
-        Some(limit) if p.default_order => {
+    match (&pipe.sink, acc) {
+        (SinkSpec::Collect { limit: Some(limit), newest: true }, Acc::Rows(mut rows)) => {
             // newest-first early stop: scan chunks until `limit` rows are found and no remaining
             // block can hold anything newer than the limit-th row
+            let limit = *limit;
             let chunk = pool.current_num_threads().max(1) * 2;
             let mut i = 0;
             while i < cands.len() {
@@ -684,37 +877,47 @@ pub fn run_query(q: &Query, snap: &Snapshot, opts: &QueryOptions) -> Result<Quer
                     }
                 }
                 let end = (i + chunk).min(cands.len());
-                let part: Vec<Row> = pool.install(|| cands[i..end].par_iter().flat_map_iter(scan_block).collect());
-                rows.extend(part);
+                if let Acc::Rows(part) = fold(&cands[i..end]) {
+                    rows.extend(part);
+                }
                 i = end;
             }
             stats.blocks_scanned = stats.blocks_scanned.min(i as u64);
+            acc = Acc::Rows(rows);
         }
-        _ => {
-            let part: Vec<Row> = pool.install(|| cands.par_iter().flat_map_iter(scan_block).collect());
-            rows.extend(part);
-        }
+        (_, a) => acc = a.merge(fold(&cands)),
     }
     if cancel.load(AtomicOrdering::Relaxed) {
         return Err(QueryError::new("query cancelled"));
     }
     stats.records_scanned = scanned.into_inner() + snap.wal.len() as u64;
     stats.blocks_damaged = damaged.into_inner();
+    stats.blocks_from_metadata = from_meta.into_inner();
 
-    if p.default_order {
-        rows.par_sort_by(newest_first);
-    }
-    let cx = Ctx { now: p.now };
-    for op in &p.rest {
-        rows = apply(op, rows, &cx, p.table)?;
-    }
-    if p.default_order {
-        if let Some(l) = p.limit {
-            if rows.len() as u64 > l {
-                rows.truncate(l as usize);
-                stats.truncated = true;
+    let mut rows = match (acc, &pipe.sink) {
+        (Acc::Rows(mut rows), SinkSpec::Collect { limit, newest: true }) => {
+            rows.par_sort_by(newest_first);
+            if let Some(l) = *limit {
+                if rows.len() as u64 > l {
+                    rows.truncate(l as usize);
+                    stats.truncated = true;
+                }
             }
+            rows
         }
+        (Acc::Rows(rows), _) => rows,
+        (Acc::Count(n), _) => vec![count_row(n)],
+        (Acc::Groups(g), _) => g.finish(),
+        (Acc::Top(t), SinkSpec::Top { cap, .. }) => {
+            let (rows, more) = t.finish();
+            stats.truncated |= *cap && more;
+            rows
+        }
+        (Acc::Top(t), _) => t.finish().0,
+        (Acc::Distinct(d), _) => d.finish(),
+    };
+    for op in &pipe.tail {
+        rows = apply(op, rows, &cx, p.table)?;
     }
     let mut res = finish(rows, p.table);
     stats.rows = res.rows.len() as u64;
@@ -723,9 +926,17 @@ pub fn run_query(q: &Query, snap: &Snapshot, opts: &QueryOptions) -> Result<Quer
     Ok(res)
 }
 
+/// Ties the closure's argument and result to one lifetime.
+fn scanner<'p, F: Fn(Acc<'p>, &(usize, usize, i64)) -> Acc<'p>>(f: F) -> F {
+    f
+}
+
+fn count_row(n: u64) -> Row {
+    Row { rec: None, cols: vec![("Count".into(), Value::I64(n as i64))], projected: true }
+}
+
 fn newest_first(a: &Row, b: &Row) -> std::cmp::Ordering {
-    let k = |r: &Row| r.rec.as_ref().map(|x| (x.time_ns, x.seq)).unwrap_or((i64::MIN, 0));
-    k(b).cmp(&k(a))
+    age_key(b).cmp(&age_key(a))
 }
 
 fn default_columns(t: Table) -> &'static [&'static str] {
@@ -752,39 +963,7 @@ fn materialize(r: &Row, t: Table) -> Vec<(String, Value)> {
 
 fn apply(op: &Op, rows: Vec<Row>, cx: &Ctx, t: Table) -> Result<Vec<Row>, QueryError> {
     Ok(match op {
-        Op::Where(e) => rows.into_iter().filter(|r| truthy(&eval(e, r, cx))).collect(),
-        Op::Search(s) => rows
-            .into_iter()
-            .filter(|r| match (&r.rec, r.projected) {
-                (Some(rec), false) => search_match(rec.as_ref(), &rec.rendered_body(), s),
-                _ => r.cols.iter().any(|(_, v)| eval::has(&v.to_text(), s, false)),
-            })
-            .collect(),
-        Op::Project(items) => rows
-            .into_iter()
-            .map(|r| {
-                let cols = items.iter().map(|(n, e)| (n.clone(), eval(e, &r, cx))).collect();
-                Row { rec: r.rec, cols, projected: true }
-            })
-            .collect(),
-        Op::ProjectAway(names) => rows
-            .into_iter()
-            .map(|r| {
-                let cols = materialize(&r, t).into_iter().filter(|(n, _)| !names.contains(n)).collect();
-                Row { rec: r.rec, cols, projected: true }
-            })
-            .collect(),
-        Op::Extend(items) => rows
-            .into_iter()
-            .map(|mut r| {
-                for (n, e) in items {
-                    let v = eval(e, &r, cx);
-                    r.cols.retain(|(k, _)| k != n);
-                    r.cols.push((n.clone(), v));
-                }
-                r
-            })
-            .collect(),
+        Op::Where(_) | Op::Search(_) | Op::Project(_) | Op::ProjectAway(_) | Op::Extend(_) => rows.into_iter().filter_map(|r| stream_op(op, r, cx, t)).collect(),
         Op::Take(n) => rows.into_iter().take(*n as usize).collect(),
         Op::Sort(keys) => sort_rows(rows, keys, cx),
         Op::Top(n, k) => {
@@ -792,60 +971,155 @@ fn apply(op: &Op, rows: Vec<Row>, cx: &Ctx, t: Table) -> Result<Vec<Row>, QueryE
             r.truncate(*n as usize);
             r
         }
-        Op::Count => vec![Row { rec: None, cols: vec![("Count".into(), Value::I64(rows.len() as i64))], projected: true }],
+        Op::Count => vec![count_row(rows.len() as u64)],
         Op::Distinct(items) => {
-            let mut seen = HashSet::new();
-            let mut out = Vec::new();
-            for r in rows {
-                let cols: Vec<(String, Value)> = items.iter().map(|(n, e)| (n.clone(), eval(e, &r, cx))).collect();
-                let key: Vec<String> = cols.iter().map(|(_, v)| group_key(v)).collect();
-                if seen.insert(key) {
-                    out.push(Row { rec: None, cols, projected: true });
-                }
+            let mut d = DistinctAcc { items, seen: HashSet::new(), out: Vec::new() };
+            for r in &rows {
+                d.push(r, cx);
             }
-            out
+            d.finish()
         }
-        Op::Summarize { aggs, by } => summarize(rows, aggs, by, cx),
+        Op::Summarize { aggs, by } => {
+            let mut g = Groups::new(aggs, by);
+            for r in &rows {
+                g.add(r, cx);
+            }
+            g.finish()
+        }
     })
 }
 
+/// Order of two rows by sort keys (nulls last unless `nulls first`).
+fn cmp_keys(keys: &[SortKey], a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    for (i, k) in keys.iter().enumerate() {
+        let (x, y) = (&a[i], &b[i]);
+        let o = match (x.is_null(), y.is_null()) {
+            (true, true) => Equal,
+            (true, false) => {
+                if k.nulls_first {
+                    Less
+                } else {
+                    Greater
+                }
+            }
+            (false, true) => {
+                if k.nulls_first {
+                    Greater
+                } else {
+                    Less
+                }
+            }
+            _ => {
+                let o = compare(x, y).unwrap_or(Equal);
+                if k.desc {
+                    o.reverse()
+                } else {
+                    o
+                }
+            }
+        };
+        if o != Equal {
+            return o;
+        }
+    }
+    Equal
+}
+
+/// Sorts by the keys; ties go newest record first, so results do not depend on scan order.
 fn sort_rows(rows: Vec<Row>, keys: &[SortKey], cx: &Ctx) -> Vec<Row> {
     let mut keyed: Vec<(Vec<Value>, Row)> = rows.into_iter().map(|r| (keys.iter().map(|k| eval(&k.expr, &r, cx)).collect(), r)).collect();
-    keyed.sort_by(|a, b| {
-        for (i, k) in keys.iter().enumerate() {
-            let (x, y) = (&a.0[i], &b.0[i]);
-            let o = match (x.is_null(), y.is_null()) {
-                (true, true) => std::cmp::Ordering::Equal,
-                (true, false) => {
-                    if k.nulls_first {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    }
-                }
-                (false, true) => {
-                    if k.nulls_first {
-                        std::cmp::Ordering::Greater
-                    } else {
-                        std::cmp::Ordering::Less
-                    }
-                }
-                _ => {
-                    let o = compare(x, y).unwrap_or(std::cmp::Ordering::Equal);
-                    if k.desc {
-                        o.reverse()
-                    } else {
-                        o
-                    }
-                }
-            };
-            if o != std::cmp::Ordering::Equal {
-                return o;
+    keyed.sort_by(|a, b| cmp_keys(keys, &a.0, &b.0).then_with(|| newest_first(&a.1, &b.1)));
+    keyed.into_iter().map(|(_, r)| r).collect()
+}
+
+/// The first `n` rows by sort keys, holding at most about 2n rows at a time.
+struct TopN<'p> {
+    keys: &'p [SortKey],
+    n: usize,
+    buf: Vec<(Vec<Value>, (i64, u64), Row)>,
+    /// the n-th row's keys once `buf` has been cut to n: anything not ahead of it is skipped
+    cutoff: Option<(Vec<Value>, (i64, u64))>,
+    seen: u64,
+}
+
+impl<'p> TopN<'p> {
+    fn new(keys: &'p [SortKey], n: usize) -> TopN<'p> {
+        TopN { keys, n, buf: Vec::new(), cutoff: None, seen: 0 }
+    }
+
+    fn ahead(&self, k: &[Value], age: (i64, u64), than: &(Vec<Value>, (i64, u64))) -> bool {
+        cmp_keys(self.keys, k, &than.0).then_with(|| than.1.cmp(&age)) == std::cmp::Ordering::Less
+    }
+
+    fn push(&mut self, f: &dyn Fields, age: (i64, u64), make: impl FnOnce() -> Row, cx: &Ctx) {
+        self.seen += 1;
+        if self.n == 0 {
+            return;
+        }
+        let k: Vec<Value> = self.keys.iter().map(|s| eval(&s.expr, f, cx)).collect();
+        if let Some(c) = &self.cutoff {
+            if !self.ahead(&k, age, c) {
+                return;
             }
         }
-        std::cmp::Ordering::Equal
-    });
-    keyed.into_iter().map(|(_, r)| r).collect()
+        self.buf.push((k, age, make()));
+        if self.buf.len() >= self.n + self.n.max(1024) {
+            self.compact();
+        }
+    }
+
+    fn compact(&mut self) {
+        let keys = self.keys;
+        self.buf.sort_by(|a, b| cmp_keys(keys, &a.0, &b.0).then_with(|| b.1.cmp(&a.1)));
+        if self.buf.len() >= self.n {
+            self.buf.truncate(self.n);
+            let last = &self.buf[self.n - 1];
+            self.cutoff = Some((last.0.clone(), last.1));
+        }
+    }
+
+    fn merge(&mut self, other: TopN<'p>) {
+        self.seen += other.seen;
+        self.buf.extend(other.buf);
+        self.compact();
+    }
+
+    /// The rows, and whether more rows matched than were kept.
+    fn finish(mut self) -> (Vec<Row>, bool) {
+        self.compact();
+        (self.buf.into_iter().map(|(_, _, r)| r).collect(), self.seen > self.n as u64)
+    }
+}
+
+struct DistinctAcc<'p> {
+    items: &'p [(String, Expr)],
+    seen: HashSet<Vec<String>>,
+    out: Vec<(Vec<String>, Row)>,
+}
+
+impl<'p> DistinctAcc<'p> {
+    fn push(&mut self, f: &dyn Fields, cx: &Ctx) {
+        let cols: Vec<(String, Value)> = self.items.iter().map(|(n, e)| (n.clone(), eval(e, f, cx))).collect();
+        let key: Vec<String> = cols.iter().map(|(_, v)| group_key(v)).collect();
+        if !self.seen.contains(&key) {
+            self.seen.insert(key.clone());
+            self.out.push((key, Row { rec: None, cols, projected: true }));
+        }
+    }
+
+    fn merge(&mut self, other: DistinctAcc<'p>) {
+        for (k, r) in other.out {
+            if !self.seen.contains(&k) {
+                self.seen.insert(k.clone());
+                self.out.push((k, r));
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<Row> {
+        self.out.into_iter().map(|(_, r)| r).collect()
+    }
 }
 
 fn group_key(v: &Value) -> String {
@@ -861,120 +1135,163 @@ enum AggState {
     Sum(Option<Value>),
 }
 
-fn summarize(rows: Vec<Row>, aggs: &[(String, Agg)], by: &[(String, Expr)], cx: &Ctx) -> Vec<Row> {
-    let new_states = || -> Vec<AggState> {
-        aggs.iter()
-            .map(|(_, a)| match a.func {
-                AggFunc::Count | AggFunc::CountIf => AggState::Count(0),
-                AggFunc::DCount => AggState::DCount(HashSet::new()),
-                AggFunc::Min => AggState::Min(None),
-                AggFunc::Max => AggState::Max(None),
-                AggFunc::Avg => AggState::Avg(0.0, 0),
-                AggFunc::Sum => AggState::Sum(None),
-            })
-            .collect()
-    };
-    let mut groups: BTreeMap<Vec<String>, (Vec<Value>, Vec<AggState>)> = BTreeMap::new();
-    let mut order: Vec<Vec<String>> = Vec::new();
-    for r in &rows {
-        let kv: Vec<Value> = by.iter().map(|(_, e)| eval(e, r, cx)).collect();
+impl AggState {
+    fn new(a: &Agg) -> AggState {
+        match a.func {
+            AggFunc::Count | AggFunc::CountIf => AggState::Count(0),
+            AggFunc::DCount => AggState::DCount(HashSet::new()),
+            AggFunc::Min => AggState::Min(None),
+            AggFunc::Max => AggState::Max(None),
+            AggFunc::Avg => AggState::Avg(0.0, 0),
+            AggFunc::Sum => AggState::Sum(None),
+        }
+    }
+
+    fn add(&mut self, a: &Agg, f: &dyn Fields, cx: &Ctx) {
+        let v = a.arg.as_ref().map(|e| eval(e, f, cx));
+        match (self, a.func) {
+            (AggState::Count(n), AggFunc::Count) => *n += 1,
+            (AggState::Count(n), AggFunc::CountIf) => {
+                if v.as_ref().is_some_and(truthy) {
+                    *n += 1
+                }
+            }
+            (AggState::DCount(s), _) => {
+                if let Some(v) = v.filter(|v| !v.is_null()) {
+                    s.insert(group_key(&v));
+                }
+            }
+            (AggState::Min(m), _) => keep_if(m, v, std::cmp::Ordering::Less),
+            (AggState::Max(m), _) => keep_if(m, v, std::cmp::Ordering::Greater),
+            (AggState::Avg(s, n), _) => {
+                if let Some(x) = v.as_ref().and_then(|v| match v {
+                    Value::Duration(d) => Some(*d as f64),
+                    other => other.as_f64(),
+                }) {
+                    *s += x;
+                    *n += 1;
+                }
+            }
+            (AggState::Sum(acc), _) => add_sum(acc, v),
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: AggState) {
+        match (self, other) {
+            (AggState::Count(a), AggState::Count(b)) => *a += b,
+            (AggState::DCount(a), AggState::DCount(b)) => a.extend(b),
+            (AggState::Min(a), AggState::Min(b)) => keep_if(a, b, std::cmp::Ordering::Less),
+            (AggState::Max(a), AggState::Max(b)) => keep_if(a, b, std::cmp::Ordering::Greater),
+            (AggState::Avg(s, n), AggState::Avg(s2, n2)) => {
+                *s += s2;
+                *n += n2;
+            }
+            (AggState::Sum(a), AggState::Sum(b)) => add_sum(a, b),
+            _ => {}
+        }
+    }
+}
+
+/// min/max: replaces `m` when `v` orders `want` against it.
+fn keep_if(m: &mut Option<Value>, v: Option<Value>, want: std::cmp::Ordering) {
+    if let Some(v) = v.filter(|v| !v.is_null()) {
+        if m.as_ref().is_none_or(|cur| compare(&v, cur) == Some(want)) {
+            *m = Some(v);
+        }
+    }
+}
+
+fn add_sum(acc: &mut Option<Value>, v: Option<Value>) {
+    if let Some(v) = v.filter(|v| !v.is_null()) {
+        *acc = Some(match acc.take() {
+            None => v,
+            Some(cur) => eval::binop(BinOp::Add, &cur, &v),
+        });
+    }
+}
+
+/// summarize state: one entry per group.
+struct Groups<'p> {
+    aggs: &'p [(String, Agg)],
+    by: &'p [(String, Expr)],
+    map: HashMap<Vec<String>, (Vec<Value>, Vec<AggState>)>,
+}
+
+impl<'p> Groups<'p> {
+    fn new(aggs: &'p [(String, Agg)], by: &'p [(String, Expr)]) -> Groups<'p> {
+        Groups { aggs, by, map: HashMap::new() }
+    }
+
+    fn add(&mut self, f: &dyn Fields, cx: &Ctx) {
+        let kv: Vec<Value> = self.by.iter().map(|(_, e)| eval(e, f, cx)).collect();
         let key: Vec<String> = kv.iter().map(group_key).collect();
-        let entry = groups.entry(key.clone()).or_insert_with(|| {
-            order.push(key);
-            (kv, new_states())
-        });
-        for (i, (_, a)) in aggs.iter().enumerate() {
-            let v = a.arg.as_ref().map(|e| eval(e, r, cx));
-            match (&mut entry.1[i], a.func) {
-                (AggState::Count(n), AggFunc::Count) => *n += 1,
-                (AggState::Count(n), AggFunc::CountIf) => {
-                    if v.as_ref().is_some_and(truthy) {
-                        *n += 1
+        let aggs = self.aggs;
+        let entry = self.map.entry(key).or_insert_with(|| (kv, aggs.iter().map(|(_, a)| AggState::new(a)).collect()));
+        for (st, (_, a)) in entry.1.iter_mut().zip(aggs) {
+            st.add(a, f, cx);
+        }
+    }
+
+    fn merge(&mut self, other: Groups<'p>) {
+        for (k, (kv, states)) in other.map {
+            match self.map.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    for (a, b) in e.get_mut().1.iter_mut().zip(states) {
+                        a.merge(b);
                     }
                 }
-                (AggState::DCount(s), _) => {
-                    if let Some(v) = v.filter(|v| !v.is_null()) {
-                        s.insert(group_key(&v));
-                    }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((kv, states));
                 }
-                (AggState::Min(m), _) => {
-                    if let Some(v) = v.filter(|v| !v.is_null()) {
-                        if m.as_ref().is_none_or(|cur| compare(&v, cur) == Some(std::cmp::Ordering::Less)) {
-                            *m = Some(v);
-                        }
-                    }
-                }
-                (AggState::Max(m), _) => {
-                    if let Some(v) = v.filter(|v| !v.is_null()) {
-                        if m.as_ref().is_none_or(|cur| compare(&v, cur) == Some(std::cmp::Ordering::Greater)) {
-                            *m = Some(v);
-                        }
-                    }
-                }
-                (AggState::Avg(s, n), _) => {
-                    if let Some(x) = v.as_ref().and_then(|v| match v {
-                        Value::Duration(d) => Some(*d as f64),
-                        other => other.as_f64(),
-                    }) {
-                        *s += x;
-                        *n += 1;
-                    }
-                }
-                (AggState::Sum(acc), _) => {
-                    if let Some(v) = v.filter(|v| !v.is_null()) {
-                        *acc = Some(match acc.take() {
-                            None => v,
-                            Some(cur) => eval::binop(BinOp::Add, &cur, &v),
-                        });
-                    }
-                }
-                _ => {}
             }
         }
     }
-    // KQL summarize with no rows and no `by` still returns one row
-    if rows.is_empty() && by.is_empty() {
-        let key = vec![];
-        order.push(key.clone());
-        groups.insert(key, (vec![], new_states()));
-    }
-    let is_duration = |i: usize| aggs[i].1.arg.as_ref().is_some_and(|e| matches!(e, Expr::Col(Column::Duration)));
-    let mut out: Vec<Row> = Vec::with_capacity(groups.len());
-    for key in order {
-        let (kv, states) = groups.remove(&key).unwrap();
-        let mut cols: Vec<(String, Value)> = by.iter().map(|(n, _)| n.clone()).zip(kv).collect();
-        for (i, st) in states.into_iter().enumerate() {
-            let v = match st {
-                AggState::Count(n) => Value::I64(n),
-                AggState::DCount(s) => Value::I64(s.len() as i64),
-                AggState::Min(m) | AggState::Max(m) | AggState::Sum(m) => m.unwrap_or(Value::Null),
-                AggState::Avg(s, n) if n > 0 => {
-                    if is_duration(i) {
-                        Value::Duration((s / n as f64) as i64)
-                    } else {
-                        Value::F64(s / n as f64)
+
+    fn finish(mut self) -> Vec<Row> {
+        let aggs = self.aggs;
+        // KQL summarize with no rows and no `by` still returns one row
+        if self.map.is_empty() && self.by.is_empty() {
+            self.map.insert(vec![], (vec![], aggs.iter().map(|(_, a)| AggState::new(a)).collect()));
+        }
+        let is_duration = |i: usize| aggs[i].1.arg.as_ref().is_some_and(|e| matches!(e, Expr::Col(Column::Duration)));
+        // group keys first, so ties in the value sort below are deterministic
+        let groups: BTreeMap<Vec<String>, (Vec<Value>, Vec<AggState>)> = self.map.into_iter().collect();
+        let mut out: Vec<Row> = Vec::with_capacity(groups.len());
+        for (_, (kv, states)) in groups {
+            let mut cols: Vec<(String, Value)> = self.by.iter().map(|(n, _)| n.clone()).zip(kv).collect();
+            for (i, st) in states.into_iter().enumerate() {
+                let v = match st {
+                    AggState::Count(n) => Value::I64(n),
+                    AggState::DCount(s) => Value::I64(s.len() as i64),
+                    AggState::Min(m) | AggState::Max(m) | AggState::Sum(m) => m.unwrap_or(Value::Null),
+                    AggState::Avg(s, n) if n > 0 => {
+                        if is_duration(i) {
+                            Value::Duration((s / n as f64) as i64)
+                        } else {
+                            Value::F64(s / n as f64)
+                        }
+                    }
+                    AggState::Avg(..) => Value::Null,
+                };
+                cols.push((aggs[i].0.clone(), v));
+            }
+            out.push(Row { rec: None, cols, projected: true });
+        }
+        if !self.by.is_empty() {
+            let nk = self.by.len();
+            out.sort_by(|a, b| {
+                for i in 0..nk {
+                    let o = compare(&a.cols[i].1, &b.cols[i].1).unwrap_or(std::cmp::Ordering::Equal);
+                    if o != std::cmp::Ordering::Equal {
+                        return o;
                     }
                 }
-                AggState::Avg(..) => Value::Null,
-            };
-            cols.push((aggs[i].0.clone(), v));
+                std::cmp::Ordering::Equal
+            });
         }
-        out.push(Row { rec: None, cols, projected: true });
+        out
     }
-    // deterministic: sort groups by their keys
-    if !by.is_empty() {
-        let nk = by.len();
-        out.sort_by(|a, b| {
-            for i in 0..nk {
-                let o = compare(&a.cols[i].1, &b.cols[i].1).unwrap_or(std::cmp::Ordering::Equal);
-                if o != std::cmp::Ordering::Equal {
-                    return o;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-    }
-    out
 }
 
 fn finish(rows: Vec<Row>, t: Table) -> QueryResult {
@@ -1028,11 +1345,7 @@ impl TailFilter {
             return None;
         }
         let cx = Ctx { now: now_ns() };
-        let mut rows = vec![row];
-        for op in &p.rest {
-            rows = apply(op, rows, &cx, p.table).ok()?;
-        }
-        let r = rows.pop()?;
+        let r = stream_row(&p.rest, row, &cx, p.table)?;
         let cols = materialize(&r, p.table);
         Some(cols.into_iter().unzip())
     }

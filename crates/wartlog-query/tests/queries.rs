@@ -190,3 +190,49 @@ fn unindexed_store_gives_same_answers() {
     let without: Vec<_> = queries.iter().map(|k| count(&s, k)).collect();
     assert_eq!(with, without);
 }
+
+/// The streaming sinks (count, summarize, top, sort | take, distinct) give the same answers as
+/// collecting every row first and applying the operator afterwards.
+#[test]
+fn streaming_sinks_match_collect_then_apply() {
+    let (_d, s) = store(10_000);
+    let all = "take 1000000000";
+    let rows = |kql: &str| {
+        let r = q(&s, kql);
+        (r.columns, r.rows.into_iter().map(|row| row.iter().map(|v| v.to_text()).collect::<Vec<_>>()).collect::<Vec<_>>(), r.ids)
+    };
+    for tail in [
+        "count",
+        "summarize n = count(), e = countif(Level == 'error'), p = dcount(_PID), lo = min(Timestamp), hi = max(Timestamp), s = sum(SeverityNumber) by Unit",
+        "summarize count() by bin(Timestamp, 10m), Level",
+        "summarize count()",
+        "top 7 by Unit asc",
+        "sort by Unit asc, SeverityNumber desc | take 9",
+        "sort by Unit desc | take 3 | project Id, Unit",
+    ] {
+        for filter in ["", "where SourceKind == 'journald' | ", "where code == 'E_TIMEOUT' | extend u = toupper(Unit) | "] {
+            let fast = rows(&format!("logs | {filter}{tail}"));
+            let slow = rows(&format!("logs | {filter}{all} | {tail}"));
+            assert_eq!(fast, slow, "logs | {filter}{tail}");
+        }
+    }
+    // distinct keeps first-seen order, which differs between the two paths; compare the sets
+    let mut a = rows("logs | distinct Unit, _PID").1;
+    let mut b = rows(&format!("logs | {all} | distinct Unit, _PID")).1;
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+    // an unfiltered count comes from block metadata and agrees with a filtered scan
+    let meta = q(&s, "logs | count");
+    assert!(meta.stats.blocks_from_metadata > 0);
+    assert_eq!(meta.rows[0][0], q(&s, "logs | where Id > 0 | count").rows[0][0]);
+    assert_eq!(count(&s, "where Timestamp >= datetime(2025-11-24T16:10:00Z)"), count(&s, "where Timestamp >= datetime(2025-11-24T16:10:00Z) and Id > 0"));
+    // the row cap bounds a plain sort and says so
+    let r = run("logs | sort by Unit asc", &s, &QueryOptions { limit: Some(50), now: Some(T0), ..Default::default() }).unwrap();
+    assert_eq!(r.rows.len(), 50);
+    assert!(r.stats.truncated);
+    // and it now applies to project as well
+    let r = run("logs | project Id, Unit", &s, &QueryOptions { limit: Some(50), now: Some(T0), ..Default::default() }).unwrap();
+    assert_eq!(r.rows.len(), 50);
+    assert!(r.stats.truncated);
+}
