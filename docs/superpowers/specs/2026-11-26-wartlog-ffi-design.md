@@ -23,7 +23,7 @@ Non-goals:
 
 - Multiple concurrent writers on one store. The single-writer design (one `flock` on `LOCK`, store-wide seqs, one owner for the WAL, open blocks, retention and term index builds) stays as it is.
 - Exposing blocks, string tables, `Rec` views or any internal struct layout across the ABI.
-- A single-file portable log format (a separate idea, see section 9).
+- A single-file portable log format (a separate idea, see section 10).
 
 ## 3. Writer modes
 
@@ -170,15 +170,28 @@ The first real consumer, used to prove the ABI: a `WartLog` NuGet package with `
 
 A compatibility policy in format.md, written before anything outside the repo reads the files: what a reader does with a newer store, segment or block version (refuse), with an unknown value tag or source kind (keep the record, show the raw value or kind number), and that reserved fields are written as zero and ignored on read unless a later version gives them a meaning (as section 4 does for bytes 10 and 11).
 
-## 9. Not in this design
+## 9. Store verification (`wl store verify`)
+
+Readers tolerate blocks out of time order and overlapping seq ranges across sources (both normal with per-source blocks), but two orderings are load-bearing. `SealedSeqs` (wartlog-store `reader.rs`) assumes that every seq in a sealed segment is sealed once a later segment exists, and that within the newest segment each source's blocks are sealed in seq order. If either breaks, readers hide unsealed WAL records, and `Writer::open` recovery skips them and then deletes the WAL files: silent loss. Duplicate seqs (two writers) make `get(seq)` return whichever copy it finds first and make dedup drop real records.
+
+The library writers reuse `Writer`, so they keep these rules, but nothing checks them today (`wl index verify` only checks term indexes). A new read-only `wl store verify`, also exposed as `wl_store_verify` in the ABI, reports:
+
+- a source whose seqs go backwards from one block to the next (in file order, across segments)
+- a seq that appears more than once
+- a sealed segment holding a seq higher than the newest segment's highest seq
+
+It exits non-zero on any finding, prints the segment, block offset and seqs involved, and never modifies the store.
+
+## 10. Not in this design
 
 A single-file portable log (one segment with its index appended, for mailing or attaching to a bug, and a natural output for redaction export). Useful, but a separate format and only built if wanted.
 
-## 10. Build order
+## 11. Build order
 
 1. Format compatibility policy, store manifest and writer kind (format.md, store crate, daemon refusal and adoption).
-2. `Request::Ingest` with seq and durability reply.
-3. A small Rust facade over store, query and the daemon client (the curated API the FFI wraps), with `pread` for the open segment and a streaming cursor.
-4. `wartlog-ffi` with all three writer modes, the cbindgen header and C tests.
-5. The C# wrapper and a sample reader and writer.
-6. `docs/protocol.md`; Arrow output if bulk reads need it.
+2. `wl store verify` (section 9), so every later step, and any writer in another language, can be checked against the seq rules.
+3. `Request::Ingest` with seq and durability reply.
+4. A small Rust facade over store, query and the daemon client (the curated API the FFI wraps), with `pread` for the open segment and a streaming cursor.
+5. `wartlog-ffi` with all three writer modes, the cbindgen header and C tests.
+6. The C# wrapper and a sample reader and writer.
+7. `docs/protocol.md`; Arrow output if bulk reads need it.
