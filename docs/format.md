@@ -3,6 +3,7 @@
 This is the normative description of what `wartlog-store` writes. If the code and this file
 disagree, it is a bug in one of them. All integers are little-endian. All checksums are CRC32C
 (Castagnoli). Nothing is transmuted from file bytes: every structure is parsed with bounds checks.
+Terms such as WAL, seq, sealing, torn tail and postings are defined in the [glossary](glossary.md).
 
 ## Store layout
 
@@ -163,7 +164,8 @@ Header (64)       magic "WARTTIX\0", u16 version (1), u16 reserved, u32 block co
                   16 segment id, u64 segment length covered, u64 FST length, u64 postings length,
                   u32 reserved, u32 CRC32C of bytes 0..60
 Block table       block count x 88-byte entries (below)
-FST               term -> offset into postings (the `fst` crate's map format)
+FST               term -> offset into postings (a finite state transducer: a compact sorted map,
+                  in the `fst` crate's format)
 Postings          per term: varint count, then varint deltas of block numbers
 u32               CRC32C of everything before it (checked by `wl index verify`, not on open)
 ```

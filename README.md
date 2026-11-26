@@ -7,7 +7,8 @@ or the Qt desktop viewer. Both read the store files directly, so history works e
 daemon is stopped.
 
 Status: MVP. See [the design](docs/superpowers/specs/2026-11-25-wartlog-mvp-design.md) and
-[the on-disk format](docs/format.md).
+[the on-disk format](docs/format.md). New to terms like WAL, segment or term index? The
+[glossary](docs/glossary.md) explains them in plain language.
 
 ## Build
 
@@ -96,15 +97,18 @@ process printing JSON). The collector read the whole journal in 171 s.
 | Errors and worse (`-p 3`, 6,172 rows) | 549 ms | 395 ms |
 | Everything in a time window (214k rows) | 18.9 s | 11.8 s |
 
-Known problems these runs found: `logs | count` holds every record in memory (it reached 120 GB on
-the 117M store), and wartlogd's resident memory grew to 15 GB during the 117M load.
+These runs found two memory problems, both fixed since: `logs | count` held every record in memory
+(it reached 120 GB on the 117M store) and now streams, and wartlogd's resident memory grew to 15 GB
+during the 117M load because freed term index memory was never returned to the OS. Still open:
+returning many rows is slow, at about 25 to 40 µs per printed row, and the term index build's peak
+memory still grows with the number of distinct words in a segment.
 
 ## Workspace
 
 | Crate | What it is |
 |---|---|
 | `wartlog-model` | record, span, source and value types; message template rendering |
-| `wartlog-store` | WAL, segments, blocks, term index, catalog, retention, read-only snapshots |
+| `wartlog-store` | write-ahead log (WAL), segments, blocks, term index, catalog, retention, read-only snapshots |
 | `wartlog-query` | the KQL subset: parser, planner (pruning by time, source, terms, trace id) and executor |
 | `wartlog-sources` | receivers and collectors |
 | `wartlog-api` | the daemon API: CBOR messages over a Unix socket, and shared query operations |
