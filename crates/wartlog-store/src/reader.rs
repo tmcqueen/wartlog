@@ -94,6 +94,7 @@ pub struct Snapshot {
     pub segments: Vec<Arc<SegmentHandle>>,
     /// unsealed records, in seq order
     pub wal: Vec<Record>,
+    pub catalog: crate::catalog::Catalog,
     /// segments that could not be opened (path, error)
     pub errors: Vec<(PathBuf, String)>,
 }
@@ -116,7 +117,12 @@ impl Snapshot {
         let mut wal: Vec<Record> = wal_records.into_iter().filter(|r| !sealed.contains(r)).collect();
         wal.sort_by_key(|r| r.seq);
         wal.dedup_by_key(|r| r.seq);
-        Ok(Snapshot { root: root.to_path_buf(), segments: segments.into_iter().map(Arc::new).collect(), wal, errors })
+        // a reader never writes: without a catalog file, derive it (slowly) from the data
+        let mut catalog = crate::catalog::Catalog::load(root).unwrap_or_else(|| crate::catalog::Catalog::rebuild(root));
+        for r in &wal {
+            catalog.add(&r.source);
+        }
+        Ok(Snapshot { root: root.to_path_buf(), catalog, segments: segments.into_iter().map(Arc::new).collect(), wal, errors })
     }
 
     pub fn block_count(&self) -> usize {

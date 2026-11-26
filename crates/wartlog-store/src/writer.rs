@@ -76,6 +76,7 @@ pub struct Writer {
     indexing: Vec<JoinHandle<()>>,
     durable_seq: u64,
     stats: WriterStats,
+    catalog: crate::catalog::Catalog,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -147,6 +148,11 @@ impl Writer {
         let next_seq = sealed.max.max(max_wal) + 1;
         let old: Vec<PathBuf> = crate::wal::list(root);
 
+        let catalog = crate::catalog::Catalog::load(root).unwrap_or_else(|| {
+            let c = crate::catalog::Catalog::rebuild(root);
+            let _ = c.save(root);
+            c
+        });
         let wal = WalFile::create(root, next_seq)?;
         let mut w = Writer {
             root: root.to_path_buf(),
@@ -161,6 +167,7 @@ impl Writer {
             indexing: Vec::new(),
             durable_seq: next_seq - 1,
             stats: WriterStats::default(),
+            catalog,
         };
         if !recovered.is_empty() {
             tracing::info!("recovering {} records from the WAL", recovered.len());
@@ -188,6 +195,9 @@ impl Writer {
     pub fn durable_seq(&self) -> u64 {
         self.durable_seq
     }
+    pub fn catalog(&self) -> &crate::catalog::Catalog {
+        &self.catalog
+    }
     pub fn last_seq(&self) -> u64 {
         self.next_seq - 1
     }
@@ -208,6 +218,9 @@ impl Writer {
 
     fn add_to_block(&mut self, r: &Record) -> Result<()> {
         let fp = r.source.fingerprint();
+        if self.catalog.add(&r.source) {
+            self.catalog.save(&self.root)?;
+        }
         let ob = self.open.entry(fp).or_insert_with(|| OpenBlock { b: BlockBuilder::new(), started: Instant::now() });
         ob.b.push(r);
         if ob.b.approx_len() >= self.opts.block_target {

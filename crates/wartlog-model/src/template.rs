@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn positional_and_named() {
         assert_eq!(render("Resolved {} to {}", &[Value::Str("db".into()), Value::Str("10.0.0.1".into())]), "Resolved db to 10.0.0.1");
-        assert_eq!(render("GET {Path} took {Elapsed:F1} ms", &[Value::Str("/x".into()), Value::F64(3.14159)]), "GET /x took 3.1 ms");
+        assert_eq!(render("GET {Path} took {Elapsed:F1} ms", &[Value::Str("/x".into()), Value::F64(3.25159)]), "GET /x took 3.3 ms");
         assert_eq!(render("{@User} {$Id,5}|", &[Value::Str("tim".into()), Value::I64(42)]), "tim    42|");
         assert_eq!(render("{{literal}} {A}", &[Value::I64(1)]), "{literal} 1");
         assert_eq!(render("missing {A} {B}", &[Value::I64(1)]), "missing 1 {B}");

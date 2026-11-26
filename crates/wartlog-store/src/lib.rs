@@ -4,6 +4,7 @@
 //! (`Snapshot`) with no locks, whether or not a writer is running.
 
 pub mod block;
+pub mod catalog;
 pub mod format;
 pub mod reader;
 pub mod segment;
@@ -12,6 +13,7 @@ pub mod wal;
 pub mod writer;
 
 pub use block::{BlockView, Rec};
+pub use catalog::Catalog;
 pub use reader::{SegmentHandle, Snapshot};
 pub use segment::BlockMeta;
 pub use writer::{Writer, WriterOptions};

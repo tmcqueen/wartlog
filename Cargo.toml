@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/wartlog-model",
     "crates/wartlog-store",
-    # "crates/wartlog-query",
+    "crates/wartlog-query",
     # "crates/wartlog-sources",
     # "crates/wartlog-api",
     # "crates/wartlogd",
@@ -36,6 +36,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+regex = "1"
+indexmap = "2"
 wartlog-model = { path = "crates/wartlog-model" }
 wartlog-store = { path = "crates/wartlog-store" }
 wartlog-query = { path = "crates/wartlog-query" }
@@ -44,3 +46,7 @@ wartlog-api = { path = "crates/wartlog-api" }
 
 [profile.release]
 debug = 1
+
+[workspace.lints.clippy]
+manual_is_multiple_of = "allow"
+too_many_arguments = "allow"
