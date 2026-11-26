@@ -7,7 +7,8 @@ or the Qt desktop viewer. Both read the store files directly, so history works e
 daemon is stopped.
 
 Status: MVP. See [the design](docs/superpowers/specs/2026-11-25-wartlog-mvp-design.md) and
-[the on-disk format](docs/format.md).
+[the on-disk format](docs/format.md). New to terms like WAL, segment or term index? The
+[glossary](docs/glossary.md) explains them in plain language.
 
 ## Build
 
@@ -104,7 +105,7 @@ the 117M store), and wartlogd's resident memory grew to 15 GB during the 117M lo
 | Crate | What it is |
 |---|---|
 | `wartlog-model` | record, span, source and value types; message template rendering |
-| `wartlog-store` | WAL, segments, blocks, term index, catalog, retention, read-only snapshots |
+| `wartlog-store` | write-ahead log (WAL), segments, blocks, term index, catalog, retention, read-only snapshots |
 | `wartlog-query` | the KQL subset: parser, planner (pruning by time, source, terms, trace id) and executor |
 | `wartlog-sources` | receivers and collectors |
 | `wartlog-api` | the daemon API: CBOR messages over a Unix socket, and shared query operations |

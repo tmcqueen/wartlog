@@ -1,6 +1,6 @@
 # WartLog MVP Design
 
-Status: approved by Tim, 2026-11-25. Built 2026-11-26; section 18 lists where the build differs from this design, and [docs/format.md](../../format.md) is the normative storage format.
+Status: approved by Tim, 2026-11-25. Built 2026-11-26; section 18 lists where the build differs from this design, and [docs/format.md](../../format.md) is the normative storage format. Unfamiliar terms (WAL, segment, block, term index, OTLP and so on) are defined in the [glossary](../../glossary.md).
 Date: 2026-11-25
 Owner: Tim (tmcqueen)
 
@@ -14,7 +14,7 @@ The honest bar to beat is a terminal: `journalctl -f | grep`, `kubectl logs -f`,
 
 ### First scenarios (from Tim)
 
-1. **Aspire projects.** A local, high performance OTLP sink for .NET Aspire apps, keeping logs and traces across runs and projects in one searchable place.
+1. **Aspire projects.** A local, high performance OTLP (OpenTelemetry Protocol) sink for .NET Aspire apps, keeping logs and traces across runs and projects in one searchable place.
 2. **Kubernetes.** Read the logs of a current Kubernetes project in a tool he is comfortable with, instead of `kubectl logs`.
 3. **journald.** Never type `journalctl -xefu foo.service` again. Pick the unit, follow it, filter it, done.
 4. **Anything else.** Any program, in any language, can send structured lines with no library.
@@ -115,7 +115,7 @@ Three forks were decided with Tim. All three picks below were his choice.
 | Crate | Purpose |
 |---|---|
 | `crates/wartlog-model` | Canonical record types (log record, span, source descriptor, typed values). No I/O. |
-| `crates/wartlog-store` | On-disk format: WAL, segment writer, block reader, indexes, rebuild, retention. |
+| `crates/wartlog-store` | On-disk format: write-ahead log (WAL), segment writer, block reader, indexes, rebuild, retention. |
 | `crates/wartlog-query` | KQL subset lexer, parser, planner, executor. Depends on model and store. |
 | `crates/wartlog-sources` | Receivers and collectors behind the `Receiver` and `Collector` traits, one Cargo feature each. |
 | `crates/wartlog-api` | API message types, framing, and an async client used by the viewer, CLI and MCP. |
@@ -413,7 +413,7 @@ The API carries what only a running daemon knows: live tail, records still in th
 
 
 - Transport: stream UNIX socket at `$XDG_RUNTIME_DIR/wartlog/api.sock`, directory mode 0700.
-- Framing: `u32` length plus a CBOR-encoded message (serde). The first exchange is a version handshake.
+- Framing: `u32` length plus a CBOR-encoded message (CBOR is a binary format shaped like JSON) (serde). The first exchange is a version handshake.
 - Requests:
   - `query { kql, time_range, limit, order }` returns a stream of row batches, then stats (blocks considered, pruned, scanned, rows, elapsed).
   - `tail { kql, backfill }` returns a stream that stays open.
