@@ -800,7 +800,7 @@ pub fn run_query(q: &Query, snap: &Snapshot, opts: &QueryOptions) -> Result<Quer
         stats.blocks += seg.blocks.len() as u64;
         cands.extend(c.into_iter().map(|bi| (si, bi, seg.blocks[bi].max_time)));
     }
-    cands.sort_by(|a, b| b.2.cmp(&a.2));
+    cands.sort_by_key(|c| std::cmp::Reverse(c.2));
     stats.blocks_scanned = cands.len() as u64;
     stats.blocks_pruned = stats.blocks - stats.blocks_scanned;
 

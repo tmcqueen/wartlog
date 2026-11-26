@@ -18,7 +18,7 @@
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use wartlog_model::{hash, tokens, Value, MIN_TERM_CHARS};
@@ -113,7 +113,10 @@ pub fn build(seg: &Segment) -> Result<Vec<u8>> {
     let cap = (records / 10).max(1024) as usize;
 
     let merge = |a: &mut Card, k: &str, vals: &mut dyn Iterator<Item = u64>| {
-        let e = a.entry(k.to_string()).or_insert_with(|| Some(HashSet::new()));
+        if !a.contains_key(k) {
+            a.insert(k.to_string(), Some(HashSet::new()));
+        }
+        let Some(e) = a.get_mut(k) else { return };
         if let Some(set) = e {
             set.extend(vals);
             if set.len() > cap {
@@ -122,95 +125,137 @@ pub fn build(seg: &Segment) -> Result<Vec<u8>> {
         }
     };
 
-    // pass 1: body terms, trace ids, key cardinality
-    let pass1: Vec<(Vec<Vec<u8>>, Card)> = blocks
-        .par_iter()
-        .map(|m| -> Result<(Vec<Vec<u8>>, Card)> {
-            let v = seg.read_block(m)?;
-            let mut terms: HashSet<Vec<u8>> = HashSet::new();
-            let mut seen_bodies: HashSet<u32> = HashSet::new();
-            let mut by_key: HashMap<&str, HashSet<u64>> = HashMap::new();
-            for r in v.iter() {
-                let text = if r.template().is_some() {
-                    Some(r.body())
-                } else if seen_bodies.insert(r.body_ref()) {
-                    Some(r.raw_body().to_string())
-                } else {
-                    None
-                };
-                if let Some(text) = text {
-                    for t in tokens(&text) {
-                        if t.chars().count() >= MIN_TERM_CHARS {
-                            terms.insert(body_term(&t));
+    // Blocks are read in parallel a chunk at a time and each chunk is merged into `post` before the
+    // next one is read, so only one chunk's per-block sets are alive at once. Chunks go in block
+    // order, so every postings list comes out sorted without a sort.
+    let chunk = rayon::current_num_threads().max(1) * 4;
+    // `post` is split into shards by term hash, so merging a chunk runs on every thread too
+    const SHARDS: usize = 64;
+    let shard_of = |t: &[u8]| (hash(t) % SHARDS as u64) as usize;
+    let mut post: Vec<HashMap<Vec<u8>, Vec<u32>>> = (0..SHARDS).map(|_| HashMap::new()).collect();
+    let split = |terms: HashSet<Vec<u8>>| -> Vec<Vec<Vec<u8>>> {
+        let mut out: Vec<Vec<Vec<u8>>> = (0..SHARDS).map(|_| Vec::new()).collect();
+        for t in terms {
+            out[shard_of(&t)].push(t);
+        }
+        out
+    };
+    // adds one chunk's terms (per block, per shard), in block order
+    let add_chunk = |post: &mut Vec<HashMap<Vec<u8>, Vec<u32>>>, first: usize, per_block: &mut Vec<Vec<Vec<Vec<u8>>>>| {
+        let cols: Vec<Vec<(u32, Vec<Vec<u8>>)>> = {
+            let mut cols: Vec<Vec<(u32, Vec<Vec<u8>>)>> = (0..SHARDS).map(|_| Vec::new()).collect();
+            for (i, shards) in per_block.drain(..).enumerate() {
+                for (s, ts) in shards.into_iter().enumerate() {
+                    if !ts.is_empty() {
+                        cols[s].push(((first + i) as u32, ts));
+                    }
+                }
+            }
+            cols
+        };
+        post.par_iter_mut().zip(cols).for_each(|(map, col)| {
+            for (bi, ts) in col {
+                for t in ts {
+                    match map.get_mut(t.as_slice()) {
+                        Some(v) => {
+                            if v.last() != Some(&bi) {
+                                v.push(bi)
+                            }
+                        }
+                        None => {
+                            map.insert(t, vec![bi]);
                         }
                     }
                 }
-                if let Some(tid) = r.trace_id() {
-                    terms.insert(trace_term(&tid));
-                }
-                r.for_each_attr(|k, val| {
-                    if let Some(t) = field_text(&val) {
-                        by_key.entry(k).or_default().insert(hash(t.as_bytes()));
-                    }
-                });
             }
-            let mut card = Card::new();
-            for (k, set) in by_key {
-                merge(&mut card, k, &mut set.into_iter());
-            }
-            Ok((terms.into_iter().collect(), card))
-        })
-        .collect::<Result<_>>()?;
+        });
+    };
 
+    // pass 1: body terms, trace ids, key cardinality
     let mut card = Card::new();
-    let mut pairs: Vec<(Vec<u8>, u32)> = Vec::new();
-    for (bi, (terms, c)) in pass1.into_iter().enumerate() {
-        pairs.extend(terms.into_iter().map(|t| (t, bi as u32)));
-        for (k, v) in c {
-            match v {
-                Some(set) => merge(&mut card, &k, &mut set.into_iter()),
-                None => {
-                    card.insert(k, None);
+    for (ci, part) in blocks.chunks(chunk).enumerate() {
+        let pass1: Vec<(Vec<Vec<Vec<u8>>>, HashMap<String, HashSet<u64>>)> = part
+            .par_iter()
+            .map(|m| -> Result<_> {
+                let v = seg.read_block(m)?;
+                let mut terms: HashSet<Vec<u8>> = HashSet::new();
+                let mut seen_bodies: HashSet<u32> = HashSet::new();
+                let mut by_key: HashMap<String, HashSet<u64>> = HashMap::new();
+                for r in v.iter() {
+                    let text = if r.template().is_some() {
+                        Some(r.body())
+                    } else if seen_bodies.insert(r.body_ref()) {
+                        Some(r.raw_body().to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(text) = text {
+                        for t in tokens(&text) {
+                            if t.chars().count() >= MIN_TERM_CHARS {
+                                terms.insert(body_term(&t));
+                            }
+                        }
+                    }
+                    if let Some(tid) = r.trace_id() {
+                        terms.insert(trace_term(&tid));
+                    }
+                    r.for_each_attr(|k, val| {
+                        if let Some(t) = field_text(&val) {
+                            match by_key.get_mut(k) {
+                                Some(s) => {
+                                    s.insert(hash(t.as_bytes()));
+                                }
+                                None => {
+                                    by_key.insert(k.to_string(), HashSet::from([hash(t.as_bytes())]));
+                                }
+                            }
+                        }
+                    });
                 }
+                Ok((split(terms), by_key))
+            })
+            .collect::<Result<_>>()?;
+        let mut per_block = Vec::with_capacity(pass1.len());
+        for (terms, by_key) in pass1 {
+            per_block.push(terms);
+            for (k, set) in by_key {
+                merge(&mut card, &k, &mut set.into_iter());
             }
         }
+        add_chunk(&mut post, ci * chunk, &mut per_block);
     }
     let indexed: HashSet<String> = card.into_iter().filter(|(_, s)| s.is_some()).map(|(k, _)| k).collect();
 
     // pass 2: field terms of indexed keys
-    let fields: Vec<Vec<Vec<u8>>> = blocks
-        .par_iter()
-        .map(|m| -> Result<Vec<Vec<u8>>> {
-            let v = seg.read_block(m)?;
-            let mut terms: HashSet<Vec<u8>> = HashSet::new();
-            for r in v.iter() {
-                r.for_each_attr(|k, val| {
-                    if indexed.contains(k) {
-                        if let Some(t) = field_text(&val) {
-                            terms.insert(field_term(k, &t));
-                        }
+    if !indexed.is_empty() {
+        for (ci, part) in blocks.chunks(chunk).enumerate() {
+            let mut fields: Vec<Vec<Vec<Vec<u8>>>> = part
+                .par_iter()
+                .map(|m| -> Result<Vec<Vec<Vec<u8>>>> {
+                    let v = seg.read_block(m)?;
+                    let mut terms: HashSet<Vec<u8>> = HashSet::new();
+                    for r in v.iter() {
+                        r.for_each_attr(|k, val| {
+                            if indexed.contains(k) {
+                                if let Some(t) = field_text(&val) {
+                                    terms.insert(field_term(k, &t));
+                                }
+                            }
+                        });
                     }
-                });
-            }
-            Ok(terms.into_iter().collect())
-        })
-        .collect::<Result<_>>()?;
-    for (bi, ts) in fields.into_iter().enumerate() {
-        pairs.extend(ts.into_iter().map(|t| (t, bi as u32)));
-    }
-    for k in &indexed {
-        pairs.push((format!("k:{k}").into_bytes(), u32::MAX));
-    }
-    pairs.par_sort_unstable();
-    pairs.dedup();
-
-    let mut terms: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
-    for (t, b) in pairs {
-        let v = terms.entry(t).or_default();
-        if b != u32::MAX {
-            v.push(b);
+                    Ok(split(terms))
+                })
+                .collect::<Result<_>>()?;
+            add_chunk(&mut post, ci * chunk, &mut fields);
         }
     }
+    for k in &indexed {
+        let t = format!("k:{k}").into_bytes();
+        post[shard_of(&t)].entry(t).or_default();
+    }
+    // the FST needs its keys in byte order
+    let mut terms: Vec<(Vec<u8>, Vec<u32>)> = post.into_iter().flatten().collect();
+    terms.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut table = Vec::with_capacity(blocks.len() * ENTRY);
     for m in blocks {
         encode_entry(&mut table, m);
@@ -251,11 +296,24 @@ pub fn build(seg: &Segment) -> Result<Vec<u8>> {
 /// Builds and atomically writes the term index next to the segment.
 pub fn write(seg_path: &Path) -> Result<usize> {
     let seg = Segment::open(seg_path)?;
-    let b = build(&seg)?;
+    let b = build(&seg);
+    // The build frees hundreds of MB spread over every rayon thread's malloc arena; glibc keeps
+    // that in the process (wartlogd held 15 GB after a 117M-record load) unless asked to return it.
+    release_free_memory();
+    let b = b?;
     let tmp = seg_path.with_extension("wtix.tmp");
     crate::write_file_synced(&tmp, &b)?;
     std::fs::rename(&tmp, tix_path(seg_path))?;
     Ok(b.len())
+}
+
+/// Returns freed heap pages to the OS (glibc only; other allocators do this on their own).
+pub fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only walks the allocator's own free lists.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 /// An open term index.
