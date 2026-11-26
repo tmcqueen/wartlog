@@ -310,7 +310,9 @@ pub fn status(s: &Status, json: bool) -> Result<()> {
     println!("store      {}  {} on disk", s.store_root, bytes(s.disk_bytes));
     println!("records    {}  ({} not yet sealed), {} segments, {} blocks", s.records, s.wal_records, s.segments, s.blocks);
     println!("ingest     {:.1} records/s (last 10 s)", s.ingest_rate);
-    println!("indexes    {} of {} segments indexed", s.segments_indexed, s.segments);
+    // the newest segment is the open one while the daemon runs; it is indexed when it closes
+    let closed = s.segments.saturating_sub(1).max(s.segments_indexed);
+    println!("indexes    {} of {} closed segments indexed (the open segment is indexed when it closes)", s.segments_indexed, closed);
     println!("config     {}", s.config_path);
     if let Some(e) = &s.config_error {
         println!("           NOT RELOADED: {e}");

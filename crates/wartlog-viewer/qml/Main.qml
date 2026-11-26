@@ -31,6 +31,7 @@ ApplicationWindow {
     function run(q) {
         if (q !== undefined) win.query = q
         queryBar.text = win.query
+        if (!queryBar.activeFocus) queryBar.cursorPosition = 0
         backend.runQuery(win.query, win.range)
         if (showTemplates) backend.loadTemplates(win.query, win.range)
         if (wantLive && backend.daemon) backend.setTail(true, win.query)
@@ -76,7 +77,7 @@ ApplicationWindow {
             const s = backend.screenshotStep
             if (s === "details" || s === "context") logList.selectIndex(5)
             if (s === "context") detailsPane.contextRequested(win.selected.rid, "source")
-            if (s === "trace") { logList.selectIndex(1); backend.loadTrace(win.selected.trace) }
+            if (s === "trace") { logList.selectWhere(r => r.trace !== ""); backend.loadTrace(win.selected ? win.selected.trace : "") }
             if (s === "templates") { win.showTemplates = true; backend.loadTemplates(win.query, win.range) }
             if (s === "error") win.run("logs | where Level = \"error\"")
             if (s === "filter") { logList.selectIndex(1); win.openSource(win.selected.source, win.selected.kind) }
@@ -86,11 +87,12 @@ ApplicationWindow {
         interval: 3000
         running: backend.screenshot !== ""
         onTriggered: {
-            const ok = win.contentItem.parent.grabToImage(function (r) {
+            const ok = root.grabToImage(function (r) {
                 console.log("screenshot saved: " + r.saveToFile(backend.screenshot) + " " + backend.screenshot)
                 Qt.quit()
             })
             console.log("screenshot requested: " + ok)
+            if (!ok) Qt.quit()
         }
     }
     Timer { id: noticeTimer; interval: 6000; onTriggered: win.lastNotice = "" }
@@ -101,56 +103,60 @@ ApplicationWindow {
     Shortcut { sequence: "Esc"; onActivated: { logList.clearSelection(); win.selected = null } }
     Shortcut { sequence: "F5"; onActivated: win.run() }
 
-    header: ToolBar {
-        RowLayout {
-            anchors.fill: parent
-            anchors.leftMargin: 6
-            anchors.rightMargin: 6
-            spacing: 6
-            ComboBox {
-                id: rangeBox
-                model: [
-                    { text: "Last 5 min", value: "5m" }, { text: "Last 15 min", value: "15m" }, { text: "Last hour", value: "1h" },
-                    { text: "Last 6 hours", value: "6h" }, { text: "Last 24 hours", value: "24h" }, { text: "Last 7 days", value: "7d" },
-                    { text: "Last 30 days", value: "30d" }, { text: "All time", value: "all" }
-                ]
-                textRole: "text"
-                valueRole: "value"
-                currentIndex: 2
-                implicitContentWidthPolicy: ComboBox.WidestText
-                onActivated: { win.range = currentValue; win.run() }
-                function select(v) { for (let i = 0; i < model.length; i++) if (model[i].value === v) currentIndex = i; win.range = v }
-            }
-            QueryBar {
-                id: queryBar
-                Layout.fillWidth: true
-                onSubmitted: (q) => win.run(q)
-            }
-            Button { text: "Run"; onClicked: win.run(queryBar.text); ToolTip.text: "Run the query (Enter)"; ToolTip.visible: hovered }
-            ToolButton {
-                text: backend.live ? "● Live" : "○ Live"
-                checkable: true
-                checked: backend.live
-                enabled: backend.daemon
-                onClicked: win.toggleLive()
-                ToolTip.text: backend.daemon ? "Live tail (Ctrl+L)" : "Live tail needs wartlogd"
-                ToolTip.visible: hovered
-            }
-            ToolButton {
-                text: "Templates"
-                checkable: true
-                checked: win.showTemplates
-                onClicked: { win.showTemplates = !win.showTemplates; if (win.showTemplates) backend.loadTemplates(win.query, win.range) }
-                ToolTip.text: "Group the results by message template"
-                ToolTip.visible: hovered
-            }
-            ToolButton { text: "Save view"; onClicked: saveDialog.open() }
-        }
-    }
-
     ColumnLayout {
+        id: root
         anchors.fill: parent
         spacing: 0
+
+        ToolBar {
+            Layout.fillWidth: true
+            position: ToolBar.Header
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 6
+                anchors.rightMargin: 6
+                spacing: 6
+                ComboBox {
+                    id: rangeBox
+                    model: [
+                        { text: "Last 5 min", value: "5m" }, { text: "Last 15 min", value: "15m" }, { text: "Last hour", value: "1h" },
+                        { text: "Last 6 hours", value: "6h" }, { text: "Last 24 hours", value: "24h" }, { text: "Last 7 days", value: "7d" },
+                        { text: "Last 30 days", value: "30d" }, { text: "All time", value: "all" }
+                    ]
+                    textRole: "text"
+                    valueRole: "value"
+                    currentIndex: 2
+                    implicitContentWidthPolicy: ComboBox.WidestText
+                    onActivated: { win.range = currentValue; win.run() }
+                    function select(v) { for (let i = 0; i < model.length; i++) if (model[i].value === v) currentIndex = i; win.range = v }
+                }
+                QueryBar {
+                    id: queryBar
+                    Layout.fillWidth: true
+                    onSubmitted: (q) => win.run(q)
+                }
+                Button { text: "Run"; onClicked: win.run(queryBar.text); ToolTip.text: "Run the query (Enter)"; ToolTip.visible: hovered }
+                ToolButton {
+                    text: backend.live ? "● Live" : "○ Live"
+                    checkable: true
+                    checked: backend.live
+                    enabled: backend.daemon
+                    onClicked: win.toggleLive()
+                    ToolTip.text: backend.daemon ? "Live tail (Ctrl+L)" : "Live tail needs wartlogd"
+                    ToolTip.visible: hovered
+                }
+                ToolButton {
+                    text: "Templates"
+                    checkable: true
+                    checked: win.showTemplates
+                    onClicked: { win.showTemplates = !win.showTemplates; if (win.showTemplates) backend.loadTemplates(win.query, win.range) }
+                    ToolTip.text: "Group the results by message template"
+                    ToolTip.visible: hovered
+                }
+                ToolButton { text: "Save view"; onClicked: saveDialog.open() }
+            }
+        }
+
 
         // no daemon: say what is off and offer to start it
         Rectangle {
@@ -198,6 +204,7 @@ ApplicationWindow {
                     currentIndex: win.showTemplates ? 1 : 0
                     LogList {
                         id: logList
+                        opacity: backend.error !== "" ? 0.4 : 1
                         live: backend.live
                         onRowSelected: (row) => { win.selected = row; if (row && row.rid >= 0) backend.showDetails(row.rid) }
                         onFilterRequested: (column, value, exclude) => win.filter(column, value, exclude)
@@ -218,17 +225,18 @@ ApplicationWindow {
                 }
             }
         }
-    }
-
-    footer: ToolBar {
-        RowLayout {
-            anchors.fill: parent
-            anchors.leftMargin: 8
-            anchors.rightMargin: 8
-            BusyIndicator { running: backend.busy; visible: backend.busy; implicitWidth: 20; implicitHeight: 20 }
-            Label { text: backend.status; elide: Text.ElideRight; Layout.fillWidth: true }
-            Label { text: win.lastNotice; elide: Text.ElideLeft; Layout.maximumWidth: win.width / 2; color: palette.highlight }
-            Label { text: backend.storePath; opacity: 0.6; elide: Text.ElideMiddle; Layout.maximumWidth: 280 }
+        ToolBar {
+            Layout.fillWidth: true
+            position: ToolBar.Footer
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 8
+                anchors.rightMargin: 8
+                BusyIndicator { running: backend.busy; visible: backend.busy; implicitWidth: 20; implicitHeight: 20 }
+                Label { text: backend.status; elide: Text.ElideRight; Layout.fillWidth: true }
+                Label { text: win.lastNotice; elide: Text.ElideLeft; Layout.maximumWidth: win.width / 2; color: palette.highlight }
+                Label { text: backend.storePath; opacity: 0.6; elide: Text.ElideMiddle; Layout.maximumWidth: 280 }
+            }
         }
     }
 

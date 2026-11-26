@@ -80,7 +80,7 @@ use crate::logic;
 use core::pin::Pin;
 use cxx_qt::Threading;
 use cxx_qt_lib::QString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use wartlog_api::proto::{ContextScope, Request, Response, Schema};
@@ -150,7 +150,7 @@ impl Default for BackendRust {
     }
 }
 
-fn snapshot(root: &PathBuf) -> anyhow::Result<Snapshot> {
+fn snapshot(root: &Path) -> anyhow::Result<Snapshot> {
     if !root.exists() {
         anyhow::bail!("no store at {} yet: start wartlogd to begin collecting", root.display());
     }
@@ -166,7 +166,7 @@ impl qobject::Backend {
         self.as_mut().set_busy(true);
         let qt = self.qt_thread();
         rt().spawn_blocking(move || {
-            let res = snapshot(&root).and_then(|s| ops::query(&s, &q, logic::range_ns(&range), Some(ROW_LIMIT)).map_err(|e| anyhow::Error::new(e)));
+            let res = snapshot(&root).and_then(|s| ops::query(&s, &q, logic::range_ns(&range), Some(ROW_LIMIT)).map_err(anyhow::Error::new));
             if gen_now.load(Ordering::SeqCst) != generation {
                 return;
             }
@@ -291,8 +291,12 @@ impl qobject::Backend {
         });
     }
 
-    fn load_trace(self: Pin<&mut Self>, trace_id: &QString) {
+    fn load_trace(mut self: Pin<&mut Self>, trace_id: &QString) {
         let t = trace_id.to_string();
+        if t.is_empty() {
+            self.as_mut().notice(QString::from("This record has no trace"));
+            return;
+        }
         let root = self.root.clone();
         let qt = self.qt_thread();
         rt().spawn_blocking(move || {

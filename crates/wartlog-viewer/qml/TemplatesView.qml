@@ -15,7 +15,9 @@ Item {
         model: tv.items
         ScrollBar.vertical: ScrollBar { }
         header: RowLayout {
-            width: ListView.view ? ListView.view.width : 0
+            width: ListView.view ? ListView.view.width - 16 : 0
+            x: 8
+            spacing: 10
             Label { text: "Count"; Layout.preferredWidth: 80; horizontalAlignment: Text.AlignRight; font.bold: true }
             Label { text: "Over time"; Layout.preferredWidth: 150; font.bold: true }
             Label { text: "Template"; Layout.fillWidth: true; font.bold: true }
@@ -25,14 +27,21 @@ Item {
             required property var modelData
             width: ListView.view.width
             height: 26
+            leftPadding: 8
+            rightPadding: 16
             onClicked: tv.templateClicked(modelData.template, false)
             MouseArea { anchors.fill: parent; acceptedButtons: Qt.RightButton; onClicked: tv.templateClicked(modelData.template, true) }
             contentItem: RowLayout {
                 spacing: 10
                 Label { text: modelData.count; Layout.preferredWidth: 80; horizontalAlignment: Text.AlignRight; font.family: "monospace" }
-                Row {
+                Rectangle {
                     Layout.preferredWidth: 150
-                    height: 16
+                    Layout.preferredHeight: 18
+                    color: Qt.rgba(0.24, 0.68, 0.91, 0.10)
+                    radius: 2
+                Row {
+                    anchors.fill: parent
+                    anchors.margins: 1
                     spacing: 1
                     property real peak: Math.max(1, Math.max.apply(null, modelData.spark))
                     Repeater {
@@ -50,8 +59,9 @@ Item {
                         }
                     }
                 }
+                }
                 Label { text: modelData.template; Layout.fillWidth: true; elide: Text.ElideRight; font.family: "monospace" }
-                Label { text: modelData.last; Layout.preferredWidth: 140; font.family: "monospace"; opacity: 0.7 }
+                Label { text: modelData.last; Layout.minimumWidth: implicitWidth; Layout.preferredWidth: 140; font.family: "monospace"; opacity: 0.7 }
             }
         }
     }

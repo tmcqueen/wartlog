@@ -50,6 +50,7 @@ Item {
 
     function clearSelection() { list.currentIndex = -1 }
     function selectIndex(i) { list.currentIndex = Math.min(i, model.count - 1) }
+    function selectWhere(pred) { for (let i = 0; i < model.count; i++) if (pred(model.get(i))) { list.currentIndex = i; return } }
     function openFind() { findBar.visible = true; findField.forceActiveFocus() }
     function findNext() {
         if (findText === "") return
@@ -111,6 +112,7 @@ Item {
                 height: 22
                 color: ListView.isCurrentItem ? palette.highlight : (index % 2 ? palette.alternateBase : palette.base)
                 readonly property color fg: ListView.isCurrentItem ? palette.highlightedText : palette.text
+                readonly property bool current: ListView.isCurrentItem
 
                 MouseArea {
                     anchors.fill: parent
@@ -152,7 +154,7 @@ Item {
                         opacity: 0.85
                     }
                     Text {
-                        text: d.model.html || ""
+                        text: d.current ? (d.model.html || "").replace(/<font color="[^"]*">/g, "<b>").replace(/<\/font>/g, "</b>") : (d.model.html || "")
                         textFormat: Text.StyledText
                         Layout.fillWidth: true
                         elide: Text.ElideRight

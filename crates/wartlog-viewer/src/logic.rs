@@ -530,11 +530,13 @@ mod tests {
 
     #[test]
     fn completion() {
-        let mut s = Schema::default();
-        s.tables = vec!["logs".into(), "spans".into()];
-        s.operators = vec!["where".into(), "take".into()];
-        s.log_columns = vec!["Level".into(), "Body".into()];
-        s.keys = vec![wartlog_api::proto::KeyInfo { key: "code".into(), values: vec!["E_TIMEOUT".into(), "200".into()] }];
+        let s = Schema {
+            tables: vec!["logs".into(), "spans".into()],
+            operators: vec!["where".into(), "take".into()],
+            log_columns: vec!["Level".into(), "Body".into()],
+            keys: vec![wartlog_api::proto::KeyInfo { key: "code".into(), values: vec!["E_TIMEOUT".into(), "200".into()] }],
+            ..Default::default()
+        };
         let items = |j: J| j["items"].as_array().unwrap().iter().map(|i| i["text"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(items(complete(&s, "lo", 2)), vec!["logs"]);
         assert_eq!(items(complete(&s, "logs | w", 8)), vec!["where"]);

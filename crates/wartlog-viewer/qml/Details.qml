@@ -36,8 +36,11 @@ Pane {
 
             // details
             ScrollView {
+                id: detailScroll
                 clip: true
                 contentWidth: availableWidth
+                // the fields usually run past the fold; keep the scrollbar visible so that shows
+                ScrollBar.vertical.policy: contentHeight > height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
                 ColumnLayout {
                     width: parent.width
                     spacing: 6
@@ -92,12 +95,16 @@ Pane {
                             }
                             ToolButton {
                                 text: "＝"
+                                implicitHeight: 24
+                                padding: 2
                                 visible: modelData.filter !== ""
                                 onClicked: pane.filterRequested(modelData.filter, modelData.typed !== undefined ? modelData.typed : modelData.value, false)
                                 ToolTip.text: "Only this"; ToolTip.visible: hovered; ToolTip.delay: 400
                             }
                             ToolButton {
                                 text: "≠"
+                                implicitHeight: 24
+                                padding: 2
                                 visible: modelData.filter !== ""
                                 onClicked: pane.filterRequested(modelData.filter, modelData.typed !== undefined ? modelData.typed : modelData.value, true)
                                 ToolTip.text: "Exclude"; ToolTip.visible: hovered; ToolTip.delay: 400
