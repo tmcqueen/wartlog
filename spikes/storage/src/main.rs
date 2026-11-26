@@ -43,6 +43,14 @@ enum Cmd {
         #[arg(long, default_value_t = 600)] block_age_s: i64,
         /// build the .wtix term index for each segment
         #[arg(long)] term_index: bool,
+        /// input format: journal (journalctl -o json) or ndjson (generic, e.g. DuckDB COPY ... FORMAT json)
+        #[arg(long, default_value = "journal")] format: String,
+        /// ndjson: comma-separated time fields, first present wins (YYYY-MM-DD HH:MM:SS[.f], UTC)
+        #[arg(long, default_value = "time")] time_field: String,
+        /// ndjson: comma-separated fields that identify the source (stream)
+        #[arg(long, default_value = "")] source_field: String,
+        /// ndjson: field holding the free-text body
+        #[arg(long)] body_field: Option<String>,
     },
     /// Query with flags (KQL comes later)
     Query {
@@ -127,7 +135,11 @@ fn dir_size(p: &Path) -> u64 {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Import { data, input, journal, repeat, block_kib, segment_mib, zstd, per_source, block_age_s, term_index } => {
+        Cmd::Import { data, input, journal, repeat, block_kib, segment_mib, zstd, per_source, block_age_s, term_index, format, time_field, source_field, body_field } => {
+            let split = |s: &str| s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>();
+            let nd = import::NdjsonOpts { table: journal.clone(), time_fields: split(&time_field), source_fields: split(&source_field), body_field };
+            let ndjson = match format.as_str() { "journal" => false, "ndjson" => true, f => bail!("unknown --format {f}") };
+            let parse = |line: &str, seq: u64, shift: i64, obs: i64| if ndjson { import::parse_ndjson(line, &nd, seq, shift, obs) } else { import::parse_line(line, &journal, seq, shift, obs) };
             if store::list_segments(&data)?.len() > 0 { bail!("{} already has segments; use an empty directory", data.display()); }
             if repeat > 1 && input == "-" { bail!("--repeat needs a file --input"); }
             // time span of the input, so repeated copies follow each other
@@ -135,7 +147,7 @@ fn main() -> Result<()> {
             if repeat > 1 {
                 let (mut lo, mut hi) = (i64::MAX, i64::MIN);
                 for line in open_input(&input)?.lines() {
-                    if let Some(r) = import::parse_line(&line?, &journal, 0, 0, 0)? { lo = lo.min(r.time_ns); hi = hi.max(r.time_ns); }
+                    if let Some(r) = parse(&line?, 0, 0, 0)? { lo = lo.min(r.time_ns); hi = hi.max(r.time_ns); }
                 }
                 span_ns = hi - lo + 1_000_000_000;
             }
@@ -150,7 +162,7 @@ fn main() -> Result<()> {
                 for line in open_input(&input)?.lines() {
                     let line = line?;
                     in_bytes += line.len() as u64 + 1;
-                    match import::parse_line(&line, &journal, seq, copy as i64 * span_ns, observed) {
+                    match parse(&line, seq, copy as i64 * span_ns, observed) {
                         Ok(Some(r)) => { w.push(&r)?; seq += 1; }
                         _ => bad += 1,
                     }

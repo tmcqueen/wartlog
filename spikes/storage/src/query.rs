@@ -138,7 +138,7 @@ pub fn run(root: &Path, mode: Mode, pred: &Pred, want_rows: bool) -> Result<(Vec
         let fields: Vec<(Option<u32>, Option<u32>, Option<i64>)> = pred.fields.iter().map(|(k, val)| {
             (v.strings.iter().position(|s| s == k).map(|x| x as u32),
              v.strings.iter().position(|s| s == val).map(|x| x as u32),
-             val.parse::<i64>().ok())
+             val.parse::<i64>().ok().or(match val.as_str() { "true" => Some(1), "false" => Some(0), _ => None }))
         }).collect();
         if fields.iter().any(|(k, s, i)| k.is_none() || (s.is_none() && i.is_none())) {
             fp_blocks.fetch_add(1, Ordering::Relaxed);
@@ -161,7 +161,7 @@ pub fn run(root: &Path, mode: Mode, pred: &Pred, want_rows: bool) -> Result<(Vec
                 for _ in 0..n {
                     let k = get_u32(p, q); let tag = p[q + 4]; q += 5;
                     let (sref, ival) = match tag {
-                        1 => { q += 1; (None, None) }
+                        1 => { q += 1; (None, Some(p[q - 1] as i64)) }
                         2 => { q += 8; (None, Some(get_i64(p, q - 8))) }
                         3 => { q += 8; (None, None) }
                         4 => { q += 4; (Some(get_u32(p, q - 4)), None) }
