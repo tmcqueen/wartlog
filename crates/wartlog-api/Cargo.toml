@@ -12,10 +12,16 @@ wartlog-store.workspace = true
 wartlog-query.workspace = true
 anyhow.workspace = true
 serde.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
 ciborium = "0.2"
 
+[features]
+default = ["async"]
+# the tokio client and async framing; without it only the blocking client is built
+async = ["dep:tokio"]
+
 [dev-dependencies]
+tokio.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -8,6 +8,7 @@ members = [
     "crates/wartlog-api",
     "crates/wartlogd",
     "crates/wartlog-cli",
+    "crates/wartlog",
 ]
 # The viewer needs Qt 6 and is built on its own: cargo build -p wartlog-viewer (see crates/wartlog-viewer/README.md)
 exclude = ["spikes", "crates/wartlog-viewer"]
@@ -42,7 +43,7 @@ wartlog-model = { path = "crates/wartlog-model" }
 wartlog-store = { path = "crates/wartlog-store" }
 wartlog-query = { path = "crates/wartlog-query" }
 wartlog-sources = { path = "crates/wartlog-sources", default-features = false }
-wartlog-api = { path = "crates/wartlog-api" }
+wartlog-api = { path = "crates/wartlog-api", default-features = false }
 
 [profile.release]
 debug = 1

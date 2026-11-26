@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
+pub mod ndjson;
 pub mod template;
 pub mod time;
 

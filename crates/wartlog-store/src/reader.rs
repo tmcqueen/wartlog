@@ -21,10 +21,13 @@ pub struct SegmentHandle {
 }
 
 impl SegmentHandle {
+    /// Opens a segment for reading. With a valid term index the segment is closed and is mapped;
+    /// otherwise it may be the open segment and is read with `pread` (see `Segment`).
     pub fn open(path: &Path) -> Result<SegmentHandle> {
-        let seg = Segment::open(path)?;
-        let header = seg.header()?;
-        let tix = Tix::open(path, &header.id, seg.len())?;
+        let probe = Segment::open_pread(path)?;
+        let header = probe.header()?;
+        let tix = Tix::open(path, &header.id, probe.len())?;
+        let seg = if tix.is_some() { Segment::open(path)? } else { probe };
         let (blocks, damaged) = match &tix {
             Some(t) => ((0..t.blocks).map(|i| t.block(i)).collect(), vec![]),
             None => {

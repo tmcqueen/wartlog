@@ -8,7 +8,8 @@ pub mod journald;
 #[cfg(feature = "kubernetes")]
 pub mod k8s;
 pub mod listeners;
-pub mod ndjson;
+/// NDJSON normalization lives in the model crate so the library can use it without the receivers.
+pub use wartlog_model::ndjson;
 #[cfg(feature = "otlp")]
 pub mod otlp;
 

@@ -17,7 +17,7 @@ wartlog-model.workspace = true
 wartlog-store.workspace = true
 wartlog-query.workspace = true
 wartlog-sources = { workspace = true, default-features = false }
-wartlog-api.workspace = true
+wartlog-api = { workspace = true, features = ["async"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

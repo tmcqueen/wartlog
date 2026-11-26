@@ -1,15 +1,19 @@
 //! WartLog daemon API (spec section 10).
 //!
 //! - [`proto`]: request and response messages, and the framing (`u32` big-endian length, then CBOR).
-//! - [`client`]: an async client for the daemon socket.
+//! - [`client`]: an async client for the daemon socket (feature `async`, on by default).
+//! - [`blocking`]: a client on plain blocking sockets, for hosts without an async runtime.
 //! - [`ops`]: the operations that work on a store snapshot (query, schema, record context, traces,
 //!   templates). Local clients call these in-process; the daemon calls the same code to answer
 //!   clients that cannot read the files.
 
+pub mod blocking;
+#[cfg(feature = "async")]
 pub mod client;
 pub mod ops;
 pub mod proto;
 
+#[cfg(feature = "async")]
 pub use client::Client;
 pub use proto::{Request, Response};
 
