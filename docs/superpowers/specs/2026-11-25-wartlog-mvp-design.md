@@ -399,6 +399,8 @@ Two tables: `logs` and `spans`. A query with no table name means `logs`. Columns
 4. Scan candidate blocks in parallel (rayon), newest first by default, decode, apply row predicates.
 5. Run the remaining operators, streaming result batches back to the client.
 
+**Search aggressiveness** is one setting, `search.aggressiveness`, from 1 ("Canadian") to 11 ("New Yorker"), default 6. It maps to the query thread pool size (1 thread at 1, every core at 11), CPU and I/O priority (`nice` and `ioprio` idle at the low end, normal at the top), and how far ahead blocks are read. Every query is cancelled as soon as the viewer's query text changes, at any setting.
+
 Live tail runs a query restricted to streaming operators (`where`, `project`, `project-away`, `extend`) against the live bus after an initial backfill.
 
 ### Conformance
