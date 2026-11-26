@@ -4,7 +4,7 @@ members = [
     "crates/wartlog-model",
     "crates/wartlog-store",
     "crates/wartlog-query",
-    # "crates/wartlog-sources",
+    "crates/wartlog-sources",
     # "crates/wartlog-api",
     # "crates/wartlogd",
     # "crates/wartlog-cli",
