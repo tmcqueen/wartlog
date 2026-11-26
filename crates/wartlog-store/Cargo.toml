@@ -1,0 +1,24 @@
+[package]
+name = "wartlog-store"
+description = "WartLog on-disk format: WAL, segments, blocks, term index, rebuild, retention"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wartlog-model.workspace = true
+anyhow.workspace = true
+crc32c.workspace = true
+zstd.workspace = true
+fst.workspace = true
+memmap2.workspace = true
+uuid.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

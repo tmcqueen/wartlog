@@ -1,0 +1,23 @@
+[package]
+name = "wartlog-query"
+description = "WartLog KQL subset: lexer, parser, planner and executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wartlog-model.workspace = true
+wartlog-store.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "wartlog-api"
+description = "WartLog daemon API: messages, framing, client, and the shared in-process operations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wartlog-model.workspace = true
+wartlog-store.workspace = true
+wartlog-query.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+tokio.workspace = true
+ciborium = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

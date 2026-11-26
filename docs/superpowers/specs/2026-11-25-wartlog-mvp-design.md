@@ -1,6 +1,6 @@
 # WartLog MVP Design
 
-Status: approved by Tim, 2026-11-25
+Status: approved by Tim, 2026-11-25. Built 2026-11-26; section 18 lists where the build differs from this design, and [docs/format.md](../../format.md) is the normative storage format.
 Date: 2026-11-25
 Owner: Tim (tmcqueen)
 
@@ -63,7 +63,7 @@ Three forks were decided with Tim. All three picks below were his choice.
 
 ### Fork 1: process shape
 
-- **Chosen: daemon plus viewer.** `wartlogd` is a Rust systemd user service with no Qt dependency (it links libsystemd for journald) that receives, collects, stores and answers queries. The viewer, the CLI, and later the MCP server are clients of its local API. Collection continues with the viewer closed, which a sink must do, and a UI crash cannot stop ingestion.
+- **Chosen: daemon plus viewer.** `wartlogd` is a Rust systemd user service with no Qt dependency (it links libsystemd for journald) that receives, collects and stores. The store and query engine are a library (`wartlog-store` plus `wartlog-query`) that the daemon, the viewer, the CLI and later the MCP server all link, so every client reads history straight from the files. The daemon's API is needed only for what only a running daemon knows: live tail, source management and status. Collection continues with the viewer closed, which a sink must do, and a UI crash cannot stop ingestion. In the other direction, **the viewer can open a store with no daemon running** (a goal Tim added on 2026-11-25), which works because sealed data never changes and every index file is replaced atomically (section 7, "Readers and the single writer").
 - Rejected: single app with the engine inside the Qt process. Closing the window would stop collection.
 
 ### Fork 2: viewer technology
@@ -306,6 +306,16 @@ Stored uncompressed after the payload, and copied into the index, so pruning nev
 
 Validation: on start and before use, each index is checked against its segment (UUID, covered block sequence, length, CRC). Any mismatch, missing file, or CRC failure triggers a rebuild of that index from the segment by scanning blocks. Rebuilds run in the background in parallel; queries over a segment with no valid index fall back to scanning it. `wl index rebuild` forces a full rebuild. Index contents are fully determined by the segment: block index entries in block order, trace index pairs sorted by `(trace_id, block_seq)` and deduplicated, catalog rows sorted by segment creation time then UUID, source descriptors sorted by fingerprint. Incremental updates must produce the same bytes as a rebuild. A required test: delete every index and the catalog, rebuild, and get byte-identical index files and identical query results.
 
+### Readers and the single writer
+
+Exactly one process writes a store: `wartlogd` holds an exclusive `flock` on `wartlog/LOCK` for its lifetime. Every other process opens the store read-only, takes no locks, and works whether or not the daemon is running.
+
+- Sealed segments and their index files never change after they are written. Index files are written to a temporary name and renamed into place, so a reader sees the old file or the new one, never a partial one. Readers memory-map index files; a rename or a retention delete does not disturb a mapping that is already open (Linux keeps the unlinked file alive until it is unmapped), and a reader that hits a missing file refreshes its snapshot.
+- The open segment only grows. A reader stops at the last block whose header, trailer and CRCs verify, so a block that is half-written does not appear.
+- The WAL holds records not yet sealed into a block. A reader may scan it read-only and keep frames whose CRC verifies; while the daemon is running this shows records a few seconds old, and after a crash it shows what the daemon will seal on its next start.
+- A reader never writes. If an index is missing or invalid, a reader falls back to scanning the segment's block summaries (proved in the storage spike to give the same pruning, only slower on a cold cache) and leaves rebuilding to the daemon or to `wl index rebuild`, which takes the lock.
+- Because a fresh process must answer quickly, every index is designed to be used straight from a memory map without parsing: fixed-size, aligned tables plus byte-oriented structures.
+
 ### Retention
 
 Delete the oldest whole segments when total size exceeds a cap (default 10 GiB) or a segment's newest `observed_time` (when it was written, not event time, so backfilled history is not deleted the moment it arrives) is older than a maximum age (default 30 days). Both are configurable. Per-source retention is a later feature.
@@ -389,6 +399,8 @@ Two tables: `logs` and `spans`. A query with no table name means `logs`. Columns
 4. Scan candidate blocks in parallel (rayon), newest first by default, decode, apply row predicates.
 5. Run the remaining operators, streaming result batches back to the client.
 
+**Search aggressiveness** is one setting, `search.aggressiveness`, from 1 ("Canadian") to 11 ("New Yorker"), default 6. It maps to the query thread pool size (1 thread at 1, every core at 11), CPU and I/O priority (`nice` and `ioprio` idle at the low end, normal at the top), and how far ahead blocks are read. Every query is cancelled as soon as the viewer's query text changes, at any setting.
+
 Live tail runs a query restricted to streaming operators (`where`, `project`, `project-away`, `extend`) against the live bus after an initial backfill.
 
 ### Conformance
@@ -396,6 +408,9 @@ Live tail runs a query restricted to streaming operators (`where`, `project`, `p
 `tools/kql-conformance` declares WartLog's schema to Kusto.Language and checks every query in `crates/wartlog-query/tests/queries/` for syntax and semantic diagnostics. Queries that rely on the implicit `logs` table are prefixed with `logs | ` before being sent to Kusto.Language, since KQL itself requires a table. CI fails if Kusto.Language and WartLog disagree on whether a query is valid. Expected results for the same queries run against fixture data are golden files.
 
 ## 10. Daemon API
+
+The API carries what only a running daemon knows: live tail, records still in the WAL, sources, status and index rebuilds. Local clients (viewer, CLI, MCP server) run history queries in-process against the files. The `query` request below remains for clients that cannot read the files directly, such as a sandboxed or remote client.
+
 
 - Transport: stream UNIX socket at `$XDG_RUNTIME_DIR/wartlog/api.sock`, directory mode 0700.
 - Framing: `u32` length plus a CBOR-encoded message (serde). The first exchange is a version handshake.
@@ -415,7 +430,7 @@ The MCP server (phase 1.5) maps onto `query`, `schema`, `templates.top`, `trace.
 
 ## 11. Viewer
 
-Built with cxx-qt and QML using Kirigami so it follows the Plasma theme. The UI talks only to the daemon API; it never reads data files.
+Built with cxx-qt and QML using Kirigami so it follows the Plasma theme. The viewer runs history queries in-process through `wartlog-store` and `wartlog-query`, the same code the daemon uses, and talks to the daemon API only for live tail, sources and status. With no daemon running it opens the store read-only: search, context, templates, traces and saved views all work, and live tail and the source dialogs are disabled behind a banner that offers to start `wartlogd`.
 
 ### Main window
 
@@ -495,7 +510,7 @@ my-app 2>&1 | wl send --source my-app
 
 **MVP milestones**, in build order. Each ends with something Tim can use.
 
-1. **Store and journald.** Model, WAL, segments, blocks, block index, rebuild, journald collector, a minimal daemon API (handshake and `query` only), and `wl query` with `where`/`take`/`sort` only. Real data from day one, and every client goes through the daemon from the start.
+1. **Store and journald.** Model, WAL, segments, blocks, block index, rebuild, journald collector, the store and query engine as a library, the store lock and read-only reader rules, and `wl query` with `where`/`take`/`sort` only, running in-process against the files. The daemon only ingests in this milestone. Real data from day one.
 2. **Query and API.** Full KQL subset, pruning, conformance suite, the rest of the daemon API, `wl tail`, `wl send` and the NDJSON receivers.
 3. **Viewer.** Main window, live tail, click to filter, completion, details, context, templates view, saved views.
 4. **OTLP.** gRPC and HTTP receivers, spans, trace index, trace panel, forwarding to the Aspire dashboard.
@@ -524,7 +539,8 @@ Targets for a typical developer laptop, measured in milestone 6, not guarantees:
 - Crash recovery: kill the daemon with SIGKILL during heavy ingest, restart, verify no corruption and loss bounded by the WAL fsync interval.
 - KQL: parser unit tests, conformance against Kusto.Language, golden results over fixture data.
 - Sources: OTLP tests using the OpenTelemetry Rust SDK exporter as the sender; NDJSON and CLEF fixtures; journald tests against a test journal file; Kubernetes tests against a kind cluster (optional CI job).
-- Viewer: Rust model logic unit tested; UI smoke test launching the viewer against a seeded daemon.
+- Viewer: Rust model logic unit tested; UI smoke test opening a seeded store both with the daemon running and with no daemon.
+- Readers and writer: a reader running queries in a loop while the daemon ingests, seals, rebuilds indexes and deletes old segments never sees an error or a partial record.
 - Benchmarks (criterion) for ingest, block encode and decode, and pruning.
 
 ## 17. Decisions left to the builder
@@ -532,3 +548,17 @@ Targets for a typical developer laptop, measured in milestone 6, not guarantees:
 Note: the block trailer carries only the low 32 bits of `block_seq`; backward scanning confirms a match by reading the header the trailer points to and checking its CRC.
 
 These were settled as reasonable defaults and are marked as such; adjust if evidence says otherwise: exact block and segment size targets, zstd level, Bloom filter sizes and token rules, CBOR as the API encoding, the libsystemd binding crate, packaging, the NDJSON TCP port, the first-run journald backfill window, and storing nested OTLP values as JSON strings.
+
+## 18. Changes made during the build (2026-11-26)
+
+Where this section and the sections above disagree, this section wins. `docs/format.md` is the normative description of the storage format.
+
+- **No Bloom filters.** The storage spike measured split-block Blooms on Tim's real journal and they pruned nothing the term index did not already prune (`spikes/storage/FINDINGS.md`). The block summary has no Bloom section.
+- **One term index per segment (`.wtix`) replaces the block index (`.widx`) and trace index (`.wtrc`).** It holds a block table (so opening a segment reads no blocks), and an FST of terms to block postings: body tokens (`t:`), low-cardinality attribute values (`f:`, with `k:` marking keys whose values are all indexed), and trace ids (`x:`). It is built when a segment closes, never modified, and a rebuild is byte-identical. A reader uses it only if its segment id and covered length match, otherwise it scans.
+- **Blocks are per source.** The writer keeps one open block per source and seals at 256 KiB or 5 seconds of wall-clock age, so source pruning is exact at block level.
+- **Catalog** is `sources.wcat` and holds source descriptors only; segment time ranges come from the term index block tables.
+- **NDJSON source naming.** A connection to the Unix or TCP receiver may start with a preamble line `@wartlog source=NAME`; `wl send --source` writes it.
+- **CLI** grew `templates`, `context`, `show`, `trace` and `index verify` alongside the commands in section 13.
+- **Viewer** uses Qt Quick Controls with the `org.kde.desktop` style when it is installed (so it still follows the Plasma theme) and Fusion otherwise, instead of Kirigami. Kirigami was not available in the build environment, and plain Controls with the desktop style gets the Plasma look without making KDE Frameworks a build requirement. Moving to Kirigami later is a QML-only change. Rows reach QML as JSON into a `ListModel`, capped at 20,000 rows; a Rust list model is the upgrade path if that becomes slow.
+- **Trace waterfall** moved from phase 2 into the MVP because the trace panel needed it anyway.
+- **Testing** has unit and integration tests per crate and a SIGKILL crash test against the real daemon binary. Not yet done from section 16: proptest round trips, a random bit-flip corruption suite (there is a targeted torn-tail and damage test), conformance against Kusto.Language, a kind-cluster Kubernetes test, and criterion benchmarks. Section 15 targets have not been measured.

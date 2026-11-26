@@ -1,0 +1,15 @@
+[package]
+name = "wartlog-model"
+description = "WartLog canonical record types: log records, spans, sources, typed values"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+xxhash-rust.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
