@@ -212,19 +212,20 @@ async fn run(cli: Cli) -> Result<()> {
             output::table(&t, *json, color, output::display_oldest_first(kql))?;
             if *stats {
                 eprintln!(
-                    "{} rows in {:.1} ms; blocks: {} total, {} pruned, {} scanned ({} via term index); {} records scanned, {} from the WAL{}",
+                    "{} rows in {:.1} ms; blocks: {} total, {} pruned, {} scanned ({} via term index, {} counted from metadata); {} records scanned, {} from the WAL{}",
                     st.rows,
                     st.elapsed_ms,
                     st.blocks,
                     st.blocks_pruned,
                     st.blocks_scanned,
                     st.used_term_index,
+                    st.blocks_from_metadata,
                     st.records_scanned,
                     st.wal_records,
                     if st.truncated { "; truncated (raise --limit or add take)" } else { "" }
                 );
             } else if st.truncated && std::io::stderr().is_terminal() {
-                eprintln!("(showing the newest {} rows; raise --limit or add `| take N`)", st.rows);
+                eprintln!("(showing the first {} rows; raise --limit or add `| take N`)", st.rows);
             }
             Ok(())
         }
