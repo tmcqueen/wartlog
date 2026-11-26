@@ -2,6 +2,7 @@
 # THROWAWAY: WartLog spike vs DuckDB on Parquet tables.
 # Reads FULL (never writes there). Stores go to WORK. Streams DuckDB NDJSON straight into wl-spike, so no JSON hits disk.
 #   FULL=~/Projects/wartlog/full TABLES="complaints transactions ride_events" YEARS=2023 ./duck-bench.sh
+# NO_BLOOM=1 leaves Bloom filters out of block summaries. DUCK_MEM caps DuckDB's export memory (default 5GB).
 # YEARS limits ride_events/transactions to files whose names contain one of these strings (empty = all files).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -60,12 +61,15 @@ for t in $TABLES; do
   if [[ ! -d $STORE || -n ${REIMPORT:-} ]]; then
     rm -rf "$STORE"
     t0=$(now)
-    duck "COPY (SELECT * FROM read_parquet($F) ORDER BY $TIME) TO '/dev/stdout' (FORMAT json)" \
-      | "$WL" import --data "$STORE" --journal "$t" --format ndjson --time-field "$TIME" --source-field "$SRC" \
-          ${BODY:+--body-field $BODY} --per-source --block-age-s 1000000000 --term-index > "$WORK/$t.import.txt"
+    TIMEV=(); [[ -x /usr/bin/time ]] && TIMEV=(/usr/bin/time -f "%M" -o)
+    ${TIMEV:+"${TIMEV[@]}" "$WORK/$t.duck.rss"} "$DUCKDB" -no-agent -noheader -list -c "SET memory_limit='${DUCK_MEM:-5GB}'; SET temp_directory='$WORK/duck.tmp'; COPY (SELECT * FROM read_parquet($F) ORDER BY $TIME) TO '/dev/stdout' (FORMAT json)" \
+      | ${TIMEV:+"${TIMEV[@]}" "$WORK/$t.wl.rss"} "$WL" import --data "$STORE" --journal "$t" --format ndjson --time-field "$TIME" --source-field "$SRC" \
+          ${BODY:+--body-field $BODY} --per-source --block-age-s 1000000000 --term-index ${NO_BLOOM:+--no-bloom} > "$WORK/$t.import.txt"
     t1=$(now)
     echo "export+import wall seconds: $(echo "$t1 - $t0" | bc)"
     cat "$WORK/$t.import.txt"
+    rm -rf "$WORK/duck.tmp"
+    [[ -f $WORK/$t.wl.rss ]] && echo "peak RSS KB: duckdb export $(tail -1 "$WORK/$t.duck.rss"), wl import $(tail -1 "$WORK/$t.wl.rss")"
   fi
   "$WL" info --data "$STORE"
   echo "parquet bytes: $(size_of "$F")  wartlog bytes: $(du -sb "$STORE" | cut -f1)"

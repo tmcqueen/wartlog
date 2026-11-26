@@ -293,7 +293,7 @@ impl BlockBuilder {
     }
 
     /// Returns (uncompressed payload, summary).
-    pub fn finish(mut self) -> (Vec<u8>, Summary) {
+    pub fn finish(mut self, with_bloom: bool) -> (Vec<u8>, Summary) {
         let mut p = Vec::with_capacity(self.approx_len + 64);
         put_u32(&mut p, self.strings.len() as u32);
         for s in &self.strings { put_u32(&mut p, s.len() as u32); p.extend_from_slice(s.as_bytes()); }
@@ -312,8 +312,8 @@ impl BlockBuilder {
 
         self.terms.sort_unstable();
         self.terms.dedup();
-        let mut bloom = Bloom::with_capacity(self.terms.len());
-        for t in &self.terms { bloom.insert(*t); }
+        let mut bloom = if with_bloom { Bloom::with_capacity(self.terms.len()) } else { Bloom::default() };
+        if with_bloom { for t in &self.terms { bloom.insert(*t); } }
         self.summary.bloom = bloom;
         self.summary.sources = self.srcs.into_iter().collect();
         self.summary.keys = self.keys.into_iter().collect();

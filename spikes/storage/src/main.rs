@@ -51,6 +51,8 @@ enum Cmd {
         #[arg(long, default_value = "")] source_field: String,
         /// ndjson: field holding the free-text body
         #[arg(long)] body_field: Option<String>,
+        /// leave Bloom filters out of block summaries (the term index does the pruning)
+        #[arg(long)] no_bloom: bool,
     },
     /// Query with flags (KQL comes later)
     Query {
@@ -135,7 +137,7 @@ fn dir_size(p: &Path) -> u64 {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Import { data, input, journal, repeat, block_kib, segment_mib, zstd, per_source, block_age_s, term_index, format, time_field, source_field, body_field } => {
+        Cmd::Import { data, input, journal, repeat, block_kib, segment_mib, zstd, per_source, block_age_s, term_index, format, time_field, source_field, body_field, no_bloom } => {
             let split = |s: &str| s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>();
             let nd = import::NdjsonOpts { table: journal.clone(), time_fields: split(&time_field), source_fields: split(&source_field), body_field };
             let ndjson = match format.as_str() { "journal" => false, "ndjson" => true, f => bail!("unknown --format {f}") };
@@ -153,7 +155,7 @@ fn main() -> Result<()> {
             }
             let mut w = store::Writer::create(&data, store::Options {
                 block_target: block_kib * 1024, segment_target: segment_mib << 20, zstd_level: zstd,
-                per_source, block_age_ns: block_age_s * 1_000_000_000, term_index,
+                per_source, block_age_ns: block_age_s * 1_000_000_000, term_index, bloom: !no_bloom,
             })?;
             let start = std::time::Instant::now();
             let (mut seq, mut in_bytes, mut bad) = (0u64, 0u64, 0u64);

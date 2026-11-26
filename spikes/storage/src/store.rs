@@ -21,6 +21,8 @@ pub struct Options {
     pub zstd_level: i32,
     /// build the .wtix term index when a segment closes
     pub term_index: bool,
+    /// write a Bloom filter in each block summary
+    pub bloom: bool,
 }
 
 /// One block as found in a segment, with its raw summary bytes.
@@ -120,7 +122,7 @@ impl Writer {
         let builder = match self.builders.remove(&key) { Some(b) if !b.is_empty() => b, _ => return Ok(()) };
         if self.seg.is_none() { self.open_segment()?; }
         let count = builder.summary.count;
-        let (payload, summary) = builder.finish();
+        let (payload, summary) = builder.finish(self.opts.bloom);
         let seg = self.seg.as_mut().unwrap();
         let seq = seg.next_block_seq;
         let bytes = encode_block(seq, count, &payload, &summary, self.opts.zstd_level);
