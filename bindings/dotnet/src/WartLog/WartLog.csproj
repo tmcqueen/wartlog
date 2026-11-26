@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <PackageId>WartLog</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Read and write WartLog log stores from .NET (P/Invoke over libwartlog).</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/tmcqueen/wartlog</RepositoryUrl>
+    <!-- path of the native library to pack (build it with cargo build, release profile, package wartlog-ffi) -->
+    <WartLogNative Condition="'$(WartLogNative)' == ''">$(MSBuildThisFileDirectory)../../../../target/release/libwartlog.so</WartLogNative>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(WartLogNative)')">
+    <None Include="$(WartLogNative)" Pack="true" PackagePath="runtimes/linux-x64/native/" Visible="false" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,25 @@
+[package]
+name = "wartlog-ffi"
+description = "WartLog C ABI: libwartlog.so, for reading and writing stores from C, C#, Python and others"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# libwartlog.so / libwartlog.a
+name = "wartlog"
+crate-type = ["cdylib", "staticlib"]
+# the C tests drive the built library; there is nothing to unit test through rlib
+test = false
+doctest = false
+
+[dependencies]
+wl = { package = "wartlog", path = "../wartlog" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
