@@ -28,6 +28,7 @@ pub struct Manager {
 
 enum Built {
     R(Box<dyn wartlog_sources::Receiver>),
+    #[cfg_attr(not(any(feature = "journald", feature = "kubernetes")), allow(dead_code))]
     C(Box<dyn wartlog_sources::Collector>),
 }
 

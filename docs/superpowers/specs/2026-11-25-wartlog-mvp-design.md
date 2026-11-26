@@ -1,6 +1,6 @@
 # WartLog MVP Design
 
-Status: approved by Tim, 2026-11-25
+Status: approved by Tim, 2026-11-25. Built 2026-11-26; section 18 lists where the build differs from this design, and [docs/format.md](../../format.md) is the normative storage format.
 Date: 2026-11-25
 Owner: Tim (tmcqueen)
 
@@ -548,3 +548,17 @@ Targets for a typical developer laptop, measured in milestone 6, not guarantees:
 Note: the block trailer carries only the low 32 bits of `block_seq`; backward scanning confirms a match by reading the header the trailer points to and checking its CRC.
 
 These were settled as reasonable defaults and are marked as such; adjust if evidence says otherwise: exact block and segment size targets, zstd level, Bloom filter sizes and token rules, CBOR as the API encoding, the libsystemd binding crate, packaging, the NDJSON TCP port, the first-run journald backfill window, and storing nested OTLP values as JSON strings.
+
+## 18. Changes made during the build (2026-11-26)
+
+Where this section and the sections above disagree, this section wins. `docs/format.md` is the normative description of the storage format.
+
+- **No Bloom filters.** The storage spike measured split-block Blooms on Tim's real journal and they pruned nothing the term index did not already prune (`spikes/storage/FINDINGS.md`). The block summary has no Bloom section.
+- **One term index per segment (`.wtix`) replaces the block index (`.widx`) and trace index (`.wtrc`).** It holds a block table (so opening a segment reads no blocks), and an FST of terms to block postings: body tokens (`t:`), low-cardinality attribute values (`f:`, with `k:` marking keys whose values are all indexed), and trace ids (`x:`). It is built when a segment closes, never modified, and a rebuild is byte-identical. A reader uses it only if its segment id and covered length match, otherwise it scans.
+- **Blocks are per source.** The writer keeps one open block per source and seals at 256 KiB or 5 seconds of wall-clock age, so source pruning is exact at block level.
+- **Catalog** is `sources.wcat` and holds source descriptors only; segment time ranges come from the term index block tables.
+- **NDJSON source naming.** A connection to the Unix or TCP receiver may start with a preamble line `@wartlog source=NAME`; `wl send --source` writes it.
+- **CLI** grew `templates`, `context`, `show`, `trace` and `index verify` alongside the commands in section 13.
+- **Viewer** uses Qt Quick Controls with the `org.kde.desktop` style when it is installed (so it still follows the Plasma theme) and Fusion otherwise, instead of Kirigami. Kirigami was not available in the build environment, and plain Controls with the desktop style gets the Plasma look without making KDE Frameworks a build requirement. Moving to Kirigami later is a QML-only change. Rows reach QML as JSON into a `ListModel`, capped at 20,000 rows; a Rust list model is the upgrade path if that becomes slow.
+- **Trace waterfall** moved from phase 2 into the MVP because the trace panel needed it anyway.
+- **Testing** has unit and integration tests per crate and a SIGKILL crash test against the real daemon binary. Not yet done from section 16: proptest round trips, a random bit-flip corruption suite (there is a targeted torn-tail and damage test), conformance against Kusto.Language, a kind-cluster Kubernetes test, and criterion benchmarks. Section 15 targets have not been measured.

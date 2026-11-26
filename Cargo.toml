@@ -41,7 +41,7 @@ indexmap = "2"
 wartlog-model = { path = "crates/wartlog-model" }
 wartlog-store = { path = "crates/wartlog-store" }
 wartlog-query = { path = "crates/wartlog-query" }
-wartlog-sources = { path = "crates/wartlog-sources" }
+wartlog-sources = { path = "crates/wartlog-sources", default-features = false }
 wartlog-api = { path = "crates/wartlog-api" }
 
 [profile.release]
