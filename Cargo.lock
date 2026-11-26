@@ -2393,6 +2393,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "wartlog-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wartlog-api",
+ "wartlog-model",
+ "wartlog-query",
+ "wartlog-store",
+ "wartlogd",
+]
+
+[[package]]
 name = "wartlog-model"
 version = "0.1.0"
 dependencies = [

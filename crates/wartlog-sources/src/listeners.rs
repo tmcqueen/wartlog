@@ -11,12 +11,20 @@ use crate::{ndjson, shutdown_signal, Receiver, Shutdown, Sink};
 pub const MAX_LINE: usize = 1 << 20;
 const BATCH: usize = 512;
 
+/// First line of a connection that names its source.
+pub const PREAMBLE: &str = "@wartlog source=";
+
 /// Reads NDJSON lines from a connection until EOF, batching into the sink.
+///
+/// A connection may start with a preamble line `@wartlog source=NAME` (what `wl send --source`
+/// writes) to name the source of its lines.
 pub async fn pump<R: AsyncRead + Unpin>(r: R, source: &str, sink: &Sink) -> anyhow::Result<u64> {
     let mut rd = BufReader::with_capacity(64 * 1024, r);
     let mut batch = Vec::with_capacity(BATCH);
     let mut line = Vec::new();
     let mut n = 0u64;
+    let mut source = source.to_string();
+    let mut first = true;
     loop {
         line.clear();
         let got = (&mut rd).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut line).await?;
@@ -31,10 +39,16 @@ pub async fn pump<R: AsyncRead + Unpin>(r: R, source: &str, sink: &Sink) -> anyh
             line.truncate(MAX_LINE);
         }
         let text = String::from_utf8_lossy(&line);
+        if std::mem::take(&mut first) {
+            if let Some(name) = text.trim_end().strip_prefix(PREAMBLE) {
+                source = name.trim().to_string();
+                continue;
+            }
+        }
         if text.trim().is_empty() {
             continue;
         }
-        batch.push(ndjson::normalize(&text, source, now_ns()));
+        batch.push(ndjson::normalize(&text, &source, now_ns()));
         n += 1;
         if batch.len() >= BATCH || rd.buffer().is_empty() {
             sink.send(std::mem::take(&mut batch)).await?;

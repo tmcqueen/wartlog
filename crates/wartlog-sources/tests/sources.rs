@@ -87,6 +87,13 @@ async fn unix_socket_ndjson() {
     c.write_all(b"{\"@mt\":\"Hello {Name}\",\"Name\":\"Tim\"}").await.unwrap();
     drop(c);
     wait_for(&got, 3).await;
+    // a named connection
+    let mut c = tokio::net::UnixStream::connect(&path).await.unwrap();
+    c.write_all(b"@wartlog source=my-app\nstarting up\n").await.unwrap();
+    drop(c);
+    wait_for(&got, 4).await;
+    assert_eq!(got.lock().unwrap()[3].source.display_name(), "my-app");
+    assert_eq!(got.lock().unwrap()[3].body, "starting up");
     {
         let g = got.lock().unwrap();
         assert_eq!(g[0].severity, 17);

@@ -7,7 +7,7 @@ members = [
     "crates/wartlog-sources",
     "crates/wartlog-api",
     "crates/wartlogd",
-    # "crates/wartlog-cli",
+    "crates/wartlog-cli",
 ]
 # The viewer needs Qt 6 and is built on its own: cargo build -p wartlog-viewer (see crates/wartlog-viewer/README.md)
 exclude = ["spikes", "crates/wartlog-viewer"]
@@ -34,7 +34,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
 regex = "1"
 indexmap = "2"
