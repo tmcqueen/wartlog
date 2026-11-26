@@ -91,3 +91,28 @@ Takeaways:
 - **Unit + window, and unit over the whole log, now beat SQLite even single-threaded** (63 vs 61 ms is a tie). Broad scans still depend on parallelism.
 - **Import cost, fixed.** The first version made import 33 s instead of 16 s. Rewriting the index build to work from each block's string table (tokenize each distinct message once and dedupe field pairs per block, instead of materializing every record) cut the build from 20.9 s to 4.0 s, and to 4.5 s on a single thread. So the waste was the problem, not the lack of threads. Import with per-source blocks and the term index now takes **16.6 s** (15.0 s without the index), with byte-identical output.
 - **Opening the store without a daemon is practical.** Every number above comes from a fresh process that memory-maps the index, with no resident state.
+
+## Round 3: DuckDB on Parquet (Tim's theme park dataset, valkyrie, 4 CPUs, 15 GB)
+
+DuckDB 2.0.1 queries the Parquet files directly. WartLog imports DuckDB's NDJSON export (`duck-bench.sh`, generic `--format ndjson` importer), ordered by event time, with per-source blocks (source = attraction, venue or channel) and the term index. Both sides are timed as fresh processes that print every matching row as JSON, median of 5. Row counts matched in every query.
+
+All 117,255,655 ride events (8 yearly files):
+
+| Query | DuckDB | WartLog | rows |
+|---|---|---|---|
+| One guest's rides | 277 ms | 11 ms | 31 |
+| One attraction, one day | 95 ms | 12 ms | 1,420 |
+| Express lane, one day (sample hit an empty day) | 59 ms | 8 ms | 0 |
+| One attraction, whole table | 5.97 s | 9.60 s | 5,263,278 |
+
+One year (2025): rides 16M rows, transactions 2.9M, complaints 65k. WartLog took 8 to 27 ms for one guest, household, attraction-day, venue-day or rare complaint word, and DuckDB took 90 to 130 ms. DuckDB won the broad scans: rarest payment method over the whole table (338 vs 518 ms) and one attraction over the whole year (0.90 vs 1.14 s).
+
+Sizes: Parquet 858 MB, WartLog 2.68 GB (3.1x larger, 22.9 bytes per record), NDJSON 24.8 GB. Import ran at 167k records/s (12 minutes, including DuckDB's sort and JSON export).
+
+Takeaways:
+
+- **Point lookups favor WartLog by 7 to 25x.** DuckDB has no index that helps a random `guest_id`, so it reads the column across the whole table; WartLog's per-block summaries and term index decode a handful of blocks. Part of DuckDB's time is a fixed floor (about 60 ms for an empty result: process start plus Parquet metadata), but the guest lookup grows with the table and WartLog's doesn't.
+- **Broad scans favor DuckDB by about 1.5x.** Columnar vectorized execution beats decoding row records and building JSON per row. This is DuckDB's home turf; WartLog's answer is the aggregations the viewer runs, which should work on columns of decoded values rather than rows of JSON.
+- **Parquet is 3.1x smaller, and most of the gap is ours to remove.** The Bloom filters are about 8 KB per block across 75k blocks, stored twice (segment summary and `.widx`): about 1.2 GB of the 2.68 GB. The compressed payload alone is 1.28 GB (1.5x Parquet). With the term index doing the pruning, Bloom filters should become optional or much smaller. Closing the rest needs columnar encoding inside a block (delta-encoded times and ids), which zstd on rows only partly recovers.
+- **The term index build ran out of memory.** It collected every distinct field value as a string, ids and timestamps included, before dropping high-cardinality fields: about 6.5 GB per 256 MiB segment, killed by the kernel while DuckDB's sort was resident. Fixed (two passes; cardinality counted as hashes with a cap): peak RSS on 1M rides went from 585 MB to 75 MB with identical output. Not yet re-measured on the full set. The build also took 299 s for 8 segments, which needs a look.
+- **Sealing blocks by event time is wrong for bulk import.** A 10-minute event-time cap on per-source blocks makes tiny blocks for sparse sources in historical data (one ride every 20 minutes per attraction gives 1 record per block). The import used a huge cap. The real writer should seal on wall-clock age for live data and on size for backfill.
