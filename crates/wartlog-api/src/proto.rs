@@ -2,6 +2,7 @@
 //! The client speaks first with `Hello`; the server answers `Hello` or `Error`.
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use wartlog_model::{Record, Value};
 use wartlog_query::QueryStats;
@@ -43,6 +44,10 @@ pub enum Request {
     TemplatesTop { kql: String, time_range: Option<TimeRange>, limit: u32 },
     Status,
     IndexRebuild { segment: Option<String> },
+    /// Writes records (their `seq` is ignored and assigned by the daemon), answered by `Ingested`.
+    /// With `durable`, the reply waits until the batch is fsynced. Records keep their order and
+    /// get consecutive seqs.
+    Ingest { records: Vec<Record>, durable: bool },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -145,6 +150,12 @@ pub struct Status {
     pub config_path: String,
     pub config_error: Option<String>,
     pub warnings: Vec<String>,
+    /// `daemon` or `external` (store manifest)
+    #[serde(default)]
+    pub store_origin: String,
+    /// segment count per writer kind (segment header), e.g. ("daemon", 12), ("exclusive", 1)
+    #[serde(default)]
+    pub segment_writers: Vec<(String, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -165,6 +176,9 @@ pub enum Response {
     Templates { templates: Vec<TemplateCount> },
     Status { status: Status },
     Ok { message: String },
+    /// Reply to `Ingest`: the batch holds seqs `first_seq..=last_seq` (`last_seq < first_seq` for an
+    /// empty batch); every seq up to `durable_seq` is fsynced.
+    Ingested { first_seq: u64, last_seq: u64, durable_seq: u64 },
 }
 
 impl Response {
@@ -192,6 +206,7 @@ pub fn encode<T: Serialize>(m: &T) -> anyhow::Result<Vec<u8>> {
     Ok(b)
 }
 
+#[cfg(feature = "async")]
 pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, m: &T) -> anyhow::Result<()> {
     let b = encode(m)?;
     w.write_all(&b).await?;
@@ -200,6 +215,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, m: &T) 
 }
 
 /// Reads one frame; `None` on a clean end of stream.
+#[cfg(feature = "async")]
 pub async fn read_frame<R: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(r: &mut R) -> anyhow::Result<Option<T>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
@@ -211,6 +227,28 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: for<'de> Deserialize<'de>>(r: &
     anyhow::ensure!(n <= MAX_FRAME, "frame too large ({n} bytes)");
     let mut b = vec![0u8; n];
     r.read_exact(&mut b).await?;
+    Ok(Some(ciborium::from_reader(&b[..])?))
+}
+
+/// Blocking `write_frame`.
+pub fn write_frame_sync<W: std::io::Write, T: Serialize>(w: &mut W, m: &T) -> anyhow::Result<()> {
+    w.write_all(&encode(m)?)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Blocking `read_frame`; `None` on a clean end of stream.
+pub fn read_frame_sync<R: std::io::Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> anyhow::Result<Option<T>> {
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let n = u32::from_be_bytes(len) as usize;
+    anyhow::ensure!(n <= MAX_FRAME, "frame too large ({n} bytes)");
+    let mut b = vec![0u8; n];
+    r.read_exact(&mut b)?;
     Ok(Some(ciborium::from_reader(&b[..])?))
 }
 

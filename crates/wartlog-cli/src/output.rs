@@ -302,6 +302,7 @@ pub fn status(s: &Status, json: bool) -> Result<()> {
                 "records": s.records, "segments": s.segments, "blocks": s.blocks, "wal_records": s.wal_records,
                 "ingest_rate": s.ingest_rate, "segments_unindexed": s.segments_unindexed, "config": s.config_path,
                 "config_error": s.config_error, "warnings": s.warnings,
+                "store_origin": s.store_origin, "segment_writers": s.segment_writers,
             })
         );
         return Ok(());
@@ -309,6 +310,10 @@ pub fn status(s: &Status, json: bool) -> Result<()> {
     println!("wartlogd {} (pid {}), up {}", s.version, s.pid, time::format_duration(s.uptime_s as i64 * time::NS));
     println!("store      {}  {} on disk", s.store_root, bytes(s.disk_bytes));
     println!("records    {}  ({} not yet sealed), {} segments, {} blocks", s.records, s.wal_records, s.segments, s.blocks);
+    if !s.segment_writers.is_empty() {
+        let w: Vec<String> = s.segment_writers.iter().map(|(k, n)| format!("{n} {k}")).collect();
+        println!("writers    {} store; segments written by: {}", s.store_origin, w.join(", "));
+    }
     println!("ingest     {:.1} records/s (last 10 s)", s.ingest_rate);
     // the newest segment is the open one while the daemon runs; it is indexed when it closes
     let closed = s.segments.saturating_sub(1).max(s.segments_indexed);

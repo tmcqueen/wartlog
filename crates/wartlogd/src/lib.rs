@@ -21,11 +21,13 @@ pub struct RunOptions {
     pub api_socket: Option<PathBuf>,
     /// how often the config file is checked for changes
     pub reload_every: Duration,
+    /// take over an external store (one a library writer created) instead of refusing it
+    pub adopt: bool,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        RunOptions { config_path: config::default_path(), store: None, api_socket: None, reload_every: Duration::from_secs(2) }
+        RunOptions { config_path: config::default_path(), store: None, api_socket: None, reload_every: Duration::from_secs(2), adopt: false }
     }
 }
 
@@ -70,7 +72,14 @@ pub async fn run(opts: RunOptions, mut shutdown: watch::Receiver<bool>) -> Resul
     let cfg = config::Config::load(&opts.config_path)?;
     let root = opts.store.clone().unwrap_or_else(|| cfg.storage.path.clone());
     wartlog_store::create_private_dir(&root)?;
-    let wopts = WriterOptions { retention_max_bytes: cfg.storage.max_size, retention_max_age: cfg.storage.max_age, ..Default::default() };
+    let wopts = WriterOptions {
+        mode: wartlog_store::WriteMode::Daemon,
+        adopt: opts.adopt,
+        creator: format!("wartlogd {}", env!("CARGO_PKG_VERSION")),
+        retention_max_bytes: cfg.storage.max_size,
+        retention_max_age: cfg.storage.max_age,
+        ..Default::default()
+    };
     let writer = Writer::open(&root, wopts)?;
     let recovered = writer.stats().recovered_from_wal;
     tracing::info!("store {} opened ({} records recovered from the WAL)", root.display(), recovered);
@@ -87,6 +96,7 @@ pub async fn run(opts: RunOptions, mut shutdown: watch::Receiver<bool>) -> Resul
     let writer_thread = std::thread::Builder::new().name("wartlog-writer".into()).spawn(move || ing.run(rt))?;
 
     let registry = StatusRegistry::default();
+    let batches = tx.clone();
     let sink = Sink::new(tx, Arc::new(SourceStatus::default()));
     let mut mgr = manager::Manager::new(sink, CursorStore::open(&root), registry);
     mgr.apply(&cfg.sources);
@@ -98,6 +108,7 @@ pub async fn run(opts: RunOptions, mut shutdown: watch::Receiver<bool>) -> Resul
         ingest: stats,
         cmds: Mutex::new(cmd_tx),
         tail,
+        batches,
         started: Instant::now(),
         reload: tokio::sync::Notify::new(),
     });

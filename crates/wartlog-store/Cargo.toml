@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 wartlog-model.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 crc32c.workspace = true
 zstd.workspace = true
 fst.workspace = true
@@ -20,6 +21,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+crc32c.workspace = true
 
 [lints]
 workspace = true

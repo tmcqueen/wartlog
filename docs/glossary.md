@@ -104,8 +104,17 @@ that indexes are correct.
 
 ## Reading while writing
 
-**Single writer.** Only one process, `wartlogd`, ever writes a store. It holds a `flock` (an
-exclusive file lock from the operating system) on the `LOCK` file to make sure of it.
+**Single writer.** Only one process at a time writes a store: `wartlogd` for the main store, or a
+program using the WartLog library for a store of its own. The writer holds a `flock` (an exclusive
+file lock from the operating system) on the `LOCK` file to make sure of it.
+
+**Store manifest, origin.** The `WARTLOG` file at the store root records the store format version
+and who owns the store: `daemon` (written by wartlogd) or `external` (created by a program using the
+WartLog library for its own log). wartlogd refuses an external store unless told to adopt it, and a
+library writer in private mode refuses a daemon store. A store with no manifest is a daemon store.
+
+**Writer kind.** A number in each segment header saying what wrote the segment (wartlogd, the
+library on its own store, or the library in exclusive mode). Informational only, for investigating.
 
 **Reader, snapshot.** Any other process (`wl`, the viewer) opens the store read-only and takes no
 locks. A snapshot is a reader's view of which segments and WAL records exist at one moment. Readers

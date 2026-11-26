@@ -14,7 +14,7 @@ path = "src/main.rs"
 wartlog-model.workspace = true
 wartlog-store.workspace = true
 wartlog-query.workspace = true
-wartlog-api.workspace = true
+wartlog-api = { workspace = true, features = ["async"] }
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

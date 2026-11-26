@@ -153,6 +153,8 @@ impl Ingest {
     fn write(&mut self, b: Batch, acks: &mut Vec<oneshot::Sender<u64>>) {
         let tail = self.tail.receiver_count() > 0;
         let n = b.records.len() as u64;
+        let first = self.writer.last_seq() + 1;
+        let mut failed: Option<String> = None;
         for r in b.records {
             let copy = tail.then(|| r.clone());
             match self.writer.push(r) {
@@ -165,8 +167,15 @@ impl Ingest {
                 Err(e) => {
                     tracing::error!("write failed: {e:#}");
                     self.stats.error(format!("write failed: {e:#}"));
+                    failed.get_or_insert_with(|| format!("write failed: {e:#}"));
                 }
             }
+        }
+        if let Some(tx) = b.seqs {
+            let _ = tx.send(match failed {
+                Some(e) => Err(e),
+                None => Ok((first, self.writer.last_seq())),
+            });
         }
         self.stats.records.fetch_add(n, Ordering::Relaxed);
         self.stats.count(n);

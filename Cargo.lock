@@ -2379,6 +2379,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wartlog"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "wartlog-api",
+ "wartlog-model",
+ "wartlog-query",
+ "wartlog-store",
+ "wartlogd",
+]
+
+[[package]]
 name = "wartlog-api"
 version = "0.1.0"
 dependencies = [
@@ -2470,6 +2486,7 @@ dependencies = [
  "memmap2",
  "rayon",
  "tempfile",
+ "thiserror",
  "tracing",
  "uuid",
  "wartlog-model",

@@ -143,6 +143,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IndexCmd,
     },
+    /// Store checks and ownership
+    Store {
+        #[command(subcommand)]
+        cmd: StoreCmd,
+    },
     /// Install and start the systemd user service, and write the default config if there is none
     Setup {
         /// path of the wartlogd binary (default: next to wl, else on PATH)
@@ -163,6 +168,23 @@ enum IndexCmd {
     },
     /// Check every term index against its segment
     Verify,
+}
+
+#[derive(Subcommand)]
+enum StoreCmd {
+    /// Check the seq rules readers and recovery depend on (read-only; exits non-zero on findings)
+    Verify {
+        /// block metadata only: skips the duplicate and hidden-WAL checks, which read every block
+        #[arg(long)]
+        quick: bool,
+        /// list at most this many findings
+        #[arg(long, default_value_t = 100)]
+        max: usize,
+    },
+    /// Show the store manifest and which writers made its segments
+    Info,
+    /// Let wartlogd write a store a library writer created (marks it as a daemon store)
+    Adopt,
 }
 
 fn store_root(cli: &Cli) -> PathBuf {
@@ -320,15 +342,16 @@ async fn run(cli: Cli) -> Result<()> {
             let segs = wartlog_store::list_segments(&root);
             for p in &segs {
                 let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let writer = wartlog_store::segment::Segment::open(p).and_then(|s| s.header()).map(|h| h.writer.name()).unwrap_or_else(|_| "?".into());
                 match wartlog_store::tix::verify(p) {
-                    Ok(true) => println!("ok       {name}"),
+                    Ok(true) => println!("ok       {name}  writer {writer}"),
                     Ok(false) => {
                         bad += 1;
-                        println!("STALE    {name}");
+                        println!("STALE    {name}  writer {writer}");
                     }
                     Err(e) => {
                         bad += 1;
-                        println!("MISSING  {name}  ({e:#})");
+                        println!("MISSING  {name}  writer {writer}  ({e:#})");
                     }
                 }
             }
@@ -337,7 +360,56 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Store { cmd } => store_cmd(&store_root(&cli), cmd),
         Cmd::Setup { daemon, no_start } => setup::setup(daemon.clone(), *no_start),
+    }
+}
+
+fn store_cmd(root: &std::path::Path, cmd: &StoreCmd) -> Result<()> {
+    if !root.is_dir() {
+        bail!("no store at {}", root.display());
+    }
+    match cmd {
+        StoreCmd::Verify { quick, max } => {
+            let opts = wartlog_store::verify::Options { full: !quick, max_findings: *max };
+            let r = wartlog_store::verify::verify_store(root, &opts);
+            for f in &r.findings {
+                println!("{}", f.describe());
+            }
+            if r.finding_count > r.findings.len() as u64 {
+                println!("... and {} more", r.finding_count - r.findings.len() as u64);
+            }
+            let read = if r.full { format!(", {} records", r.records) } else { " (metadata only)".to_string() };
+            eprintln!("checked {} segments, {} blocks{read}, {} WAL records", r.segments, r.blocks, r.wal_records);
+            if !r.ok() {
+                bail!("{} finding(s)", r.finding_count);
+            }
+            println!("ok");
+            Ok(())
+        }
+        StoreCmd::Info => {
+            match wartlog_store::Manifest::load(root)? {
+                Some(m) => {
+                    println!("origin       {}", m.origin.name());
+                    println!("format       store version {}", m.store_version);
+                    println!("created      {} by {}", wartlog_model::time::format_rfc3339(m.created_ns), m.creator);
+                }
+                None => println!("origin       daemon (no manifest: made before manifests existed)"),
+            }
+            let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+            for p in wartlog_store::list_segments(root) {
+                let k = wartlog_store::segment::Segment::open(&p).and_then(|s| s.header()).map(|h| h.writer.name()).unwrap_or_else(|_| "unreadable".into());
+                *kinds.entry(k).or_default() += 1;
+            }
+            let k: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
+            println!("segments     {}", if k.is_empty() { "none".to_string() } else { k.join(", ") });
+            Ok(())
+        }
+        StoreCmd::Adopt => {
+            let m = wartlog_store::manifest::adopt(root)?;
+            println!("{} is now a {} store", root.display(), m.origin.name());
+            Ok(())
+        }
     }
 }
 

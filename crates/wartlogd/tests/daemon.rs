@@ -38,7 +38,7 @@ async fn start(dir: tempfile::TempDir) -> D {
         std::fs::write(&cfg, re).unwrap();
     }
     let api = dir.path().join("api.sock");
-    let opts = wartlogd::RunOptions { config_path: cfg, store: Some(dir.path().join("store")), api_socket: Some(api.clone()), reload_every: Duration::from_millis(100) };
+    let opts = wartlogd::RunOptions { config_path: cfg, store: Some(dir.path().join("store")), api_socket: Some(api.clone()), reload_every: Duration::from_millis(100), ..Default::default() };
     let (stop, rx) = tokio::sync::watch::channel(false);
     let h = tokio::spawn(wartlogd::run(opts, rx));
     for _ in 0..300 {
@@ -207,6 +207,73 @@ async fn second_daemon_is_refused() {
     let (_tx, rx) = tokio::sync::watch::channel(false);
     let e = wartlogd::run(opts, rx).await.unwrap_err().to_string();
     assert!(e.contains("another"), "{e}");
+    d.stop.send(true).unwrap();
+    d.h.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_store_is_refused_unless_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let w = wartlog_store::Writer::open(&store, wartlog_store::WriterOptions { mode: wartlog_store::WriteMode::Private, ..Default::default() }).unwrap();
+    w.close().unwrap();
+    std::fs::write(dir.path().join("wartlog.toml"), config(dir.path(), &format!("127.0.0.1:{}", free_port()))).unwrap();
+    let opts = |adopt| wartlogd::RunOptions {
+        config_path: dir.path().join("wartlog.toml"),
+        store: Some(store.clone()),
+        api_socket: Some(dir.path().join("api.sock")),
+        adopt,
+        ..Default::default()
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let e = format!("{:#}", wartlogd::run(opts(false), rx).await.unwrap_err());
+    assert!(e.contains("external store"), "{e}");
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let h = tokio::spawn(wartlogd::run(opts(true), rx));
+    for _ in 0..300 {
+        if Client::connect(&dir.path().join("api.sock"), "test").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = Client::connect(&dir.path().join("api.sock"), "test").await.unwrap();
+    match c.call_one(&Request::Status).await.unwrap() {
+        Response::Status { status } => assert_eq!(status.store_origin, "daemon"),
+        other => panic!("{other:?}"),
+    }
+    tx.send(true).unwrap();
+    h.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingest_request_returns_seqs_and_durability() {
+    use std::sync::Arc;
+    use wartlog_model::{Record, Source, SourceKind};
+    let d = start(tempfile::tempdir().unwrap()).await;
+    let mut c = Client::connect(&d.api, "test").await.unwrap();
+    let src = Arc::new(Source::new(SourceKind::Ndjson, vec![("source.name".into(), "lib".into())]));
+    let batch = |n: usize, tag: &str| (0..n).map(|i| Record::log(src.clone(), wartlog_model::time::now_ns(), 9, format!("{tag} {i}"))).collect::<Vec<_>>();
+    let (f1, l1, dur1) = match c.call_one(&Request::Ingest { records: batch(3, "first"), durable: true }).await.unwrap() {
+        Response::Ingested { first_seq, last_seq, durable_seq } => (first_seq, last_seq, durable_seq),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(l1 - f1, 2);
+    assert!(dur1 >= l1, "durable reply must cover the batch: {dur1} < {l1}");
+    let (f2, l2) = match c.call_one(&Request::Ingest { records: batch(2, "second"), durable: false }).await.unwrap() {
+        Response::Ingested { first_seq, last_seq, .. } => (first_seq, last_seq),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((f2, l2), (l1 + 1, l1 + 2));
+    match c.call_one(&Request::Ingest { records: vec![], durable: true }).await.unwrap() {
+        Response::Ingested { first_seq, last_seq, .. } => assert!(last_seq < first_seq),
+        other => panic!("{other:?}"),
+    }
+    // the seqs are the record ids
+    match c.call_one(&Request::RecordGet { id: f1 + 1 }).await.unwrap() {
+        Response::Record { record: Some(r) } => assert_eq!(r.body, "first 1"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(count(&mut c, "logs | where Source == 'lib'").await, 5);
     d.stop.send(true).unwrap();
     d.h.await.unwrap().unwrap();
 }

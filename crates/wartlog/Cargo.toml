@@ -1,0 +1,25 @@
+[package]
+name = "wartlog"
+description = "WartLog as a library: read stores with KQL and write records, from Rust (the C ABI wraps this crate)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wartlog-model.workspace = true
+wartlog-store.workspace = true
+wartlog-query.workspace = true
+wartlog-api.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wartlogd = { path = "../wartlogd" }
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -132,7 +132,13 @@ fn end_to_end() {
     assert!(got[1].contains("plain ERROR line"), "{got:?}");
 
     e.ok(&["index", "rebuild"]);
-    e.ok(&["index", "verify"]);
+    let out = e.ok(&["index", "verify"]);
+    assert!(out.contains("writer daemon"), "{out}");
+    assert!(e.ok(&["store", "verify"]).contains("ok"));
+    let out = e.ok(&["store", "info"]);
+    assert!(out.contains("origin       daemon") && out.contains("wartlogd"), "{out}");
+    let out = e.ok(&["status"]);
+    assert!(out.contains("daemon store; segments written by:"), "{out}");
 
     stop.send(true).unwrap();
     rt.block_on(daemon).unwrap().unwrap();

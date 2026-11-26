@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value as J};
 use std::sync::Arc;
-use wartlog_model::{severity_from_text, template, time, unhex, Record, Source, SourceKind, Value};
+use crate::{severity_from_text, template, time, unhex, Record, Source, SourceKind, Value};
 
 /// Parses a timestamp value: RFC 3339 text, or epoch seconds/ms/us/ns by magnitude.
 pub fn parse_time(v: &J) -> Option<i64> {
@@ -52,7 +52,7 @@ fn text(v: &J) -> String {
 /// Best-effort level from the start of a plain text line (`ERROR ...`, `[warn] ...`, `level=info`).
 pub fn sniff_level(line: &str) -> u8 {
     let head: String = line.chars().take(48).collect();
-    for tok in wartlog_model::tokens(&head) {
+    for tok in crate::tokens(&head) {
         let sev = match tok.as_str() {
             "trace" | "trc" => 1,
             "debug" | "dbg" => 5,

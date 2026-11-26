@@ -21,10 +21,13 @@ pub struct SegmentHandle {
 }
 
 impl SegmentHandle {
+    /// Opens a segment for reading. With a valid term index the segment is closed and is mapped;
+    /// otherwise it may be the open segment and is read with `pread` (see `Segment`).
     pub fn open(path: &Path) -> Result<SegmentHandle> {
-        let seg = Segment::open(path)?;
-        let header = seg.header()?;
-        let tix = Tix::open(path, &header.id, seg.len())?;
+        let probe = Segment::open_pread(path)?;
+        let header = probe.header()?;
+        let tix = Tix::open(path, &header.id, probe.len())?;
+        let seg = if tix.is_some() { Segment::open(path)? } else { probe };
         let (blocks, damaged) = match &tix {
             Some(t) => ((0..t.blocks).map(|i| t.block(i)).collect(), vec![]),
             None => {
@@ -101,6 +104,8 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn open(root: &Path) -> Result<Snapshot> {
+        // refuse a store format newer than this build (compatibility policy)
+        crate::manifest::Manifest::load(root)?;
         // WAL before segments: a record sealed (and its WAL file deleted) in between is then found
         // in the segment, so nothing falls through the gap; overlap is removed below.
         let wal_records = crate::wal::read_all(root);

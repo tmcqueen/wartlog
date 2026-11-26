@@ -6,20 +6,51 @@
 pub mod block;
 pub mod catalog;
 pub mod format;
+pub mod manifest;
 pub mod reader;
 pub mod segment;
 pub mod tix;
+pub mod verify;
 pub mod wal;
 pub mod writer;
 
 pub use block::{BlockView, Rec};
 pub use catalog::Catalog;
+pub use format::{UnsupportedVersion, WriterKind};
+pub use manifest::{Manifest, Origin};
 pub use reader::{SegmentHandle, Snapshot};
 pub use segment::BlockMeta;
-pub use writer::{Writer, WriterOptions};
+pub use writer::{WriteMode, Writer, WriterOptions};
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+
+/// Errors callers act on (the C ABI maps each to its own code). They travel inside `anyhow::Error`;
+/// find them with `downcast_ref::<StoreError>()` or `StoreError::find`.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    /// another process holds the store lock
+    #[error("another process is writing {0} (is wartlogd running?)")]
+    Locked(PathBuf),
+    /// a library writer (private mode) was pointed at a store wartlogd owns
+    #[error("{0} is a daemon store; write it through wartlogd (shared mode), or in exclusive mode with wartlogd stopped")]
+    DaemonStore(PathBuf),
+    /// wartlogd was pointed at a store the library created
+    #[error("{0} is an external store (created by a library writer); adopt it first (wartlogd --adopt or wl store adopt)")]
+    ExternalStore(PathBuf),
+    #[error("no WartLog store at {0}")]
+    NotFound(PathBuf),
+    /// the store, a segment or the manifest has a format version newer than this build reads
+    #[error("{0}")]
+    NewerFormat(format::UnsupportedVersion),
+}
+
+impl StoreError {
+    /// The first `StoreError` in an error chain, if any.
+    pub fn find(e: &anyhow::Error) -> Option<&StoreError> {
+        e.chain().find_map(|c| c.downcast_ref::<StoreError>())
+    }
+}
 
 /// Default store location: `$XDG_DATA_HOME/wartlog` or `~/.local/share/wartlog`.
 pub fn default_root() -> PathBuf {

@@ -80,47 +80,162 @@ pub struct Scan {
     pub recomputed_summaries: usize,
 }
 
-/// Memory-mapped segment file. A growing (open) segment is mapped up to its length at open time.
+/// How a segment's bytes are reached. Closed segments (with a term index) never change and are
+/// memory-mapped. A segment without an index may be the open one, which crash recovery can
+/// truncate: touching mapped pages past the new end raises SIGBUS and kills the process (fatal for
+/// a .NET or Python host), so those are read with `pread`, which just returns short.
+enum Backing {
+    Map(memmap2::Mmap),
+    File { f: File, len: u64 },
+}
+
 pub struct Segment {
     pub path: PathBuf,
-    map: memmap2::Mmap,
+    backing: Backing,
 }
 
 impl Segment {
+    /// Memory-maps the segment (for closed segments and for the writer).
     pub fn open(path: &Path) -> Result<Segment> {
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         // SAFETY: segments are append-only and never modified in place by WartLog; a reader maps
         // only the bytes present at open time and validates every structure it reads.
         let map = unsafe { memmap2::Mmap::map(&f)? };
-        Ok(Segment { path: path.to_path_buf(), map })
+        Ok(Segment { path: path.to_path_buf(), backing: Backing::Map(map) })
+    }
+
+    /// Opens without mapping: every read is a `pread` of the bytes present at open time.
+    pub fn open_pread(path: &Path) -> Result<Segment> {
+        let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let len = f.metadata()?.len();
+        Ok(Segment { path: path.to_path_buf(), backing: Backing::File { f, len } })
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.backing, Backing::Map(_))
     }
 
     pub fn len(&self) -> u64 {
-        self.map.len() as u64
+        match &self.backing {
+            Backing::Map(m) => m.len() as u64,
+            Backing::File { len, .. } => *len,
+        }
     }
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
     }
-    pub fn bytes(&self) -> &[u8] {
-        &self.map
+
+    /// Reads `n` bytes at `off`; fewer when the file is shorter (it may have been truncated).
+    fn read_at(&self, off: u64, n: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
+        match &self.backing {
+            Backing::Map(m) => {
+                let s = (off as usize).min(m.len());
+                let e = s.saturating_add(n).min(m.len());
+                Ok(std::borrow::Cow::Borrowed(&m[s..e]))
+            }
+            Backing::File { f, len } => {
+                use std::os::unix::fs::FileExt;
+                let n = n.min(len.saturating_sub(off) as usize);
+                let mut b = vec![0u8; n];
+                let mut got = 0;
+                while got < n {
+                    match f.read_at(&mut b[got..], off + got as u64)? {
+                        0 => break,
+                        k => got += k,
+                    }
+                }
+                b.truncate(got);
+                Ok(std::borrow::Cow::Owned(b))
+            }
+        }
     }
 
     pub fn header(&self) -> Result<SegmentHeader> {
-        SegmentHeader::decode(&self.map)
+        SegmentHeader::decode(&self.read_at(0, SEG_HEADER_LEN)?)
     }
 
     /// Walks every block. With `verify_payload`, also checks payload CRCs (needed to recompute
     /// a damaged summary and for verification; planning does not need it).
     pub fn scan(&self, verify_payload: bool) -> Scan {
-        scan_bytes(&self.map, verify_payload)
+        match &self.backing {
+            Backing::Map(m) => scan_bytes(m, verify_payload),
+            Backing::File { len, .. } => self.scan_pread(*len, verify_payload),
+        }
+    }
+
+    /// Block by block with reads of the header, summary and trailer (and the payload when it has
+    /// to be checked). At the first invalid block, reads the rest of the file and resyncs as
+    /// `scan_bytes` does: usually that is a short torn tail.
+    fn scan_pread(&self, len: u64, verify_payload: bool) -> Scan {
+        let mut out = Scan::default();
+        let Ok(hb) = self.read_at(0, SEG_HEADER_LEN) else { return out };
+        let Ok(header) = SegmentHeader::decode(&hb) else { return out };
+        out.header = Some(header);
+        let mut off = SEG_HEADER_LEN as u64;
+        out.valid_len = off;
+        while off + BLOCK_HEADER_LEN as u64 <= len {
+            match self.try_block_pread(off, len, verify_payload) {
+                Some((meta, total, recomputed)) => {
+                    out.recomputed_summaries += recomputed as usize;
+                    out.blocks.push(meta);
+                    off += total as u64;
+                    out.valid_len = off;
+                }
+                None => {
+                    let Ok(rest) = self.read_at(off, (len - off) as usize) else { break };
+                    let mut tail = Scan::default();
+                    scan_blocks(&rest, 0, verify_payload, &mut tail);
+                    out.recomputed_summaries += tail.recomputed_summaries;
+                    for mut m in tail.blocks {
+                        m.offset += off;
+                        out.blocks.push(m);
+                    }
+                    out.damaged.extend(tail.damaged.into_iter().map(|(a, b)| (a + off, b + off)));
+                    if tail.valid_len > 0 {
+                        out.valid_len = off + tail.valid_len;
+                    }
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn try_block_pread(&self, off: u64, len: u64, verify_payload: bool) -> Option<(BlockMeta, usize, bool)> {
+        let hb = self.read_at(off, BLOCK_HEADER_LEN).ok()?;
+        let h = BlockHeader::decode(&hb)?;
+        let total = h.total_len();
+        if off + total as u64 > len {
+            return None;
+        }
+        let s0 = off + (BLOCK_HEADER_LEN + h.compressed_len as usize) as u64;
+        let st = self.read_at(s0, h.summary_len as usize + BLOCK_TRAILER_LEN).ok()?;
+        if st.len() < h.summary_len as usize + BLOCK_TRAILER_LEN {
+            return None;
+        }
+        let (sum, trailer) = st.split_at(h.summary_len as usize);
+        if decode_trailer(trailer, h.block_seq)? as usize != total {
+            return None;
+        }
+        let summary_ok = crc32c::crc32c(sum) == h.summary_crc;
+        if summary_ok && !verify_payload {
+            let s = Summary::decode(sum).ok()?;
+            return Some((BlockMeta::from_summary(off, &h, &s), total, false));
+        }
+        let payload = self.read_at(off + BLOCK_HEADER_LEN as u64, h.compressed_len as usize).ok()?;
+        let p = decompress(&h, &payload).ok()?;
+        let s = if summary_ok { Summary::decode(sum).ok()? } else { recompute_summary(p, h.record_count).ok()? };
+        Some((BlockMeta::from_summary(off, &h, &s), total, !summary_ok))
     }
 
     /// Reads, verifies and decodes one block.
     pub fn read_block(&self, m: &BlockMeta) -> Result<BlockView> {
-        let start = m.offset as usize + BLOCK_HEADER_LEN;
-        let end = start + m.compressed_len as usize;
-        let payload = self.map.get(start..end).context("block beyond end of segment")?;
-        let p = decompress(&m.header(), payload)?;
+        let start = m.offset + BLOCK_HEADER_LEN as u64;
+        let payload = self.read_at(start, m.compressed_len as usize)?;
+        if payload.len() != m.compressed_len as usize {
+            anyhow::bail!("block beyond end of segment");
+        }
+        let p = decompress(&m.header(), &payload)?;
         BlockView::parse(p, m.record_count)
     }
 }
@@ -132,7 +247,12 @@ pub fn scan_bytes(b: &[u8], verify_payload: bool) -> Scan {
         Err(_) => return out,
     };
     out.header = Some(header);
-    let mut off = SEG_HEADER_LEN;
+    scan_blocks(b, SEG_HEADER_LEN, verify_payload, &mut out);
+    out
+}
+
+/// Scans blocks in `b` from `off`, resyncing past damage. Offsets are relative to `b`.
+fn scan_blocks(b: &[u8], mut off: usize, verify_payload: bool, out: &mut Scan) {
     out.valid_len = off as u64;
     while off + BLOCK_HEADER_LEN <= b.len() {
         match try_block(b, off, verify_payload) {
@@ -173,7 +293,6 @@ pub fn scan_bytes(b: &[u8], verify_payload: bool) -> Scan {
             }
         }
     }
-    out
 }
 
 fn try_block(b: &[u8], off: usize, verify_payload: bool) -> Option<(BlockMeta, usize, bool)> {
@@ -220,7 +339,7 @@ mod tests {
     use crate::block::{encode_block, tests::sample};
 
     fn segment_bytes(blocks: usize) -> Vec<u8> {
-        let mut out = SegmentHeader { id: [1; 16], prev: [0; 16], created_ns: 0 }.encode();
+        let mut out = SegmentHeader { id: [1; 16], prev: [0; 16], created_ns: 0, writer: WriterKind::Daemon }.encode();
         let mut seq = 1;
         for bs in 0..blocks {
             let mut b = BlockBuilder::new();
@@ -269,5 +388,71 @@ mod tests {
         assert_eq!(s2.blocks.len(), 2);
         assert_eq!(s2.recomputed_summaries, 1);
         assert_eq!(s2.blocks[0], s.blocks[0]);
+    }
+}
+
+#[cfg(test)]
+mod pread_tests {
+    use super::*;
+    use crate::block::{encode_block, tests::sample};
+
+    fn file_with(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s.wseg");
+        std::fs::write(&p, bytes).unwrap();
+        (d, p)
+    }
+
+    fn segment_bytes(blocks: usize) -> Vec<u8> {
+        let mut out = SegmentHeader { id: [1; 16], prev: [0; 16], created_ns: 0, writer: WriterKind::Daemon }.encode();
+        let mut seq = 1;
+        for bs in 0..blocks {
+            let mut b = BlockBuilder::new();
+            for _ in 0..20 {
+                b.push(&sample(seq));
+                seq += 1;
+            }
+            let (p, s) = b.finish();
+            out.extend(encode_block(bs as u64, &p, &s, 1));
+        }
+        out
+    }
+
+    #[test]
+    fn pread_scan_matches_mmap_scan() {
+        let b = segment_bytes(5);
+        let mut cases = vec![b.clone(), b[..b.len() - 7].to_vec()];
+        let s = scan_bytes(&b, false);
+        // damaged header in the middle, and a damaged summary
+        let mut d = b.clone();
+        d[s.blocks[2].offset as usize + 10] ^= 0xff;
+        cases.push(d);
+        let mut d = b.clone();
+        let m = &s.blocks[1];
+        d[m.offset as usize + BLOCK_HEADER_LEN + m.compressed_len as usize + 2] ^= 0xff;
+        cases.push(d);
+        for (i, c) in cases.iter().enumerate() {
+            let (_d, p) = file_with(c);
+            for verify in [false, true] {
+                let a = Segment::open(&p).unwrap().scan(verify);
+                let r = Segment::open_pread(&p).unwrap().scan(verify);
+                assert_eq!(a.blocks, r.blocks, "case {i} verify {verify}");
+                assert_eq!(a.damaged, r.damaged, "case {i}");
+                assert_eq!(a.valid_len, r.valid_len, "case {i}");
+                assert_eq!(a.recomputed_summaries, r.recomputed_summaries, "case {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn pread_survives_truncation_after_open() {
+        let b = segment_bytes(4);
+        let (_d, p) = file_with(&b);
+        let seg = Segment::open_pread(&p).unwrap();
+        let blocks = seg.scan(false).blocks;
+        // crash recovery trims the file while a reader holds it: reads fail, the process lives
+        std::fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(blocks[2].offset).unwrap();
+        assert!(seg.read_block(&blocks[0]).is_ok());
+        assert!(seg.read_block(&blocks[3]).is_err());
     }
 }
