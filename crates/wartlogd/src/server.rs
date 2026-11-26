@@ -26,6 +26,8 @@ pub struct Shared {
     pub ingest: Arc<IngestStats>,
     pub cmds: Mutex<std::sync::mpsc::Sender<Cmd>>,
     pub tail: broadcast::Sender<Arc<Record>>,
+    /// the writer's batch queue, for `Ingest` requests
+    pub batches: tokio::sync::mpsc::Sender<wartlog_sources::Batch>,
     pub started: Instant,
     /// set after a config edit so the reload loop picks it up at once
     pub reload: tokio::sync::Notify,
@@ -138,6 +140,10 @@ async fn handle(req: Request, sh: &Arc<Shared>) -> Vec<Response> {
             Ok(status) => vec![Response::Status { status }],
             Err(e) => err(e),
         },
+        Request::Ingest { records, durable } => match ingest(sh, records, durable).await {
+            Ok((first_seq, last_seq, durable_seq)) => vec![Response::Ingested { first_seq, last_seq, durable_seq }],
+            Err(e) => err(e),
+        },
         Request::IndexRebuild { segment } => {
             let (tx, rx) = oneshot::channel();
             if sh.cmds.lock().unwrap().send(Cmd::RebuildIndex { segment, reply: tx }).is_err() {
@@ -150,6 +156,21 @@ async fn handle(req: Request, sh: &Arc<Shared>) -> Vec<Response> {
             }
         }
     }
+}
+
+/// Hands a batch to the writer thread and waits for its seqs (and, with `durable`, the fsync).
+async fn ingest(sh: &Arc<Shared>, records: Vec<Record>, durable: bool) -> Result<(u64, u64, u64)> {
+    let (stx, srx) = oneshot::channel();
+    let (atx, arx) = oneshot::channel();
+    let batch = wartlog_sources::Batch { records, ack: durable.then_some(atx), seqs: Some(stx) };
+    sh.batches.send(batch).await.map_err(|_| anyhow::anyhow!("the writer is not running"))?;
+    let (first, last) = srx.await.map_err(|_| anyhow::anyhow!("the writer stopped"))?.map_err(|e| anyhow::anyhow!(e))?;
+    let durable_seq = if durable {
+        arx.await.map_err(|_| anyhow::anyhow!("the batch was written but the WAL sync failed; it is not durable"))?
+    } else {
+        sh.ingest.durable_seq.load(Ordering::Relaxed)
+    };
+    Ok((first, last, durable_seq))
 }
 
 async fn edit(sh: &Arc<Shared>, f: impl FnOnce(&std::path::Path) -> Result<()> + Send + 'static) -> Vec<Response> {

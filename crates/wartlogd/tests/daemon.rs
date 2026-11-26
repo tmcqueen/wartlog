@@ -244,3 +244,36 @@ async fn external_store_is_refused_unless_adopted() {
     tx.send(true).unwrap();
     h.await.unwrap().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingest_request_returns_seqs_and_durability() {
+    use std::sync::Arc;
+    use wartlog_model::{Record, Source, SourceKind};
+    let d = start(tempfile::tempdir().unwrap()).await;
+    let mut c = Client::connect(&d.api, "test").await.unwrap();
+    let src = Arc::new(Source::new(SourceKind::Ndjson, vec![("source.name".into(), "lib".into())]));
+    let batch = |n: usize, tag: &str| (0..n).map(|i| Record::log(src.clone(), wartlog_model::time::now_ns(), 9, format!("{tag} {i}"))).collect::<Vec<_>>();
+    let (f1, l1, dur1) = match c.call_one(&Request::Ingest { records: batch(3, "first"), durable: true }).await.unwrap() {
+        Response::Ingested { first_seq, last_seq, durable_seq } => (first_seq, last_seq, durable_seq),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(l1 - f1, 2);
+    assert!(dur1 >= l1, "durable reply must cover the batch: {dur1} < {l1}");
+    let (f2, l2) = match c.call_one(&Request::Ingest { records: batch(2, "second"), durable: false }).await.unwrap() {
+        Response::Ingested { first_seq, last_seq, .. } => (first_seq, last_seq),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((f2, l2), (l1 + 1, l1 + 2));
+    match c.call_one(&Request::Ingest { records: vec![], durable: true }).await.unwrap() {
+        Response::Ingested { first_seq, last_seq, .. } => assert!(last_seq < first_seq),
+        other => panic!("{other:?}"),
+    }
+    // the seqs are the record ids
+    match c.call_one(&Request::RecordGet { id: f1 + 1 }).await.unwrap() {
+        Response::Record { record: Some(r) } => assert_eq!(r.body, "first 1"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(count(&mut c, "logs | where Source == 'lib'").await, 5);
+    d.stop.send(true).unwrap();
+    d.h.await.unwrap().unwrap();
+}

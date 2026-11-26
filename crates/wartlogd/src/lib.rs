@@ -96,6 +96,7 @@ pub async fn run(opts: RunOptions, mut shutdown: watch::Receiver<bool>) -> Resul
     let writer_thread = std::thread::Builder::new().name("wartlog-writer".into()).spawn(move || ing.run(rt))?;
 
     let registry = StatusRegistry::default();
+    let batches = tx.clone();
     let sink = Sink::new(tx, Arc::new(SourceStatus::default()));
     let mut mgr = manager::Manager::new(sink, CursorStore::open(&root), registry);
     mgr.apply(&cfg.sources);
@@ -107,6 +108,7 @@ pub async fn run(opts: RunOptions, mut shutdown: watch::Receiver<bool>) -> Resul
         ingest: stats,
         cmds: Mutex::new(cmd_tx),
         tail,
+        batches,
         started: Instant::now(),
         reload: tokio::sync::Notify::new(),
     });

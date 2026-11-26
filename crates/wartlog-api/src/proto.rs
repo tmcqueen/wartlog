@@ -43,6 +43,10 @@ pub enum Request {
     TemplatesTop { kql: String, time_range: Option<TimeRange>, limit: u32 },
     Status,
     IndexRebuild { segment: Option<String> },
+    /// Writes records (their `seq` is ignored and assigned by the daemon), answered by `Ingested`.
+    /// With `durable`, the reply waits until the batch is fsynced. Records keep their order and
+    /// get consecutive seqs.
+    Ingest { records: Vec<Record>, durable: bool },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -171,6 +175,9 @@ pub enum Response {
     Templates { templates: Vec<TemplateCount> },
     Status { status: Status },
     Ok { message: String },
+    /// Reply to `Ingest`: the batch holds seqs `first_seq..=last_seq` (`last_seq < first_seq` for an
+    /// empty batch); every seq up to `durable_seq` is fsynced.
+    Ingested { first_seq: u64, last_seq: u64, durable_seq: u64 },
 }
 
 impl Response {

@@ -37,6 +37,9 @@ pub async fn shutdown_signal(mut s: Shutdown) {
 pub struct Batch {
     pub records: Vec<Record>,
     pub ack: Option<oneshot::Sender<u64>>,
+    /// receives the seqs given to the batch (first, last), or why it was not fully written.
+    /// Sent as soon as the records are accepted, before they are durable.
+    pub seqs: Option<oneshot::Sender<Result<(u64, u64), String>>>,
 }
 
 /// Per-source counters shown by `status`.
@@ -126,21 +129,21 @@ impl Sink {
             return Ok(());
         }
         self.count(records.len());
-        self.tx.send(Batch { records, ack: None }).await.map_err(|_| anyhow::anyhow!("writer stopped"))
+        self.tx.send(Batch { records, ack: None, seqs: None }).await.map_err(|_| anyhow::anyhow!("writer stopped"))
     }
 
     /// Sends a batch and waits until it is durable. Returns the durable seq.
     pub async fn send_durable(&self, records: Vec<Record>) -> anyhow::Result<u64> {
         let (tx, rx) = oneshot::channel();
         self.count(records.len());
-        self.tx.send(Batch { records, ack: Some(tx) }).await.map_err(|_| anyhow::anyhow!("writer stopped"))?;
+        self.tx.send(Batch { records, ack: Some(tx), seqs: None }).await.map_err(|_| anyhow::anyhow!("writer stopped"))?;
         rx.await.map_err(|_| anyhow::anyhow!("writer stopped before the batch was durable"))
     }
 
     /// Never waits: drops (and counts) the batch when the writer is full. For datagram transports.
     pub fn try_send(&self, records: Vec<Record>) -> bool {
         let n = records.len();
-        match self.tx.try_send(Batch { records, ack: None }) {
+        match self.tx.try_send(Batch { records, ack: None, seqs: None }) {
             Ok(()) => {
                 self.count(n);
                 true
