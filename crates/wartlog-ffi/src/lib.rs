@@ -451,7 +451,7 @@ pub unsafe extern "C" fn wl_cursor_stats_json(c: *mut wl_cursor, json: *mut *mut
     })
 }
 
-fn value_of<'a>(r: &'a wl_row, col: u32) -> Result<&'a Value, Fail> {
+fn value_of(r: &wl_row, col: u32) -> Result<&Value, Fail> {
     r.row.values.get(col as usize).ok_or_else(|| invalid(format!("column {col} out of range")))
 }
 
