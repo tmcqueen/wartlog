@@ -116,3 +116,22 @@ Takeaways:
 - **Parquet is 3.1x smaller, and most of the gap is ours to remove.** The Bloom filters are about 8 KB per block across 75k blocks, stored twice (segment summary and `.widx`): about 1.2 GB of the 2.68 GB. The compressed payload alone is 1.28 GB (1.5x Parquet). With the term index doing the pruning, Bloom filters should become optional or much smaller. Closing the rest needs columnar encoding inside a block (delta-encoded times and ids), which zstd on rows only partly recovers.
 - **The term index build ran out of memory.** It collected every distinct field value as a string, ids and timestamps included, before dropping high-cardinality fields: about 6.5 GB per 256 MiB segment, killed by the kernel while DuckDB's sort was resident. Fixed (two passes; cardinality counted as hashes with a cap): peak RSS on 1M rides went from 585 MB to 75 MB with identical output. Not yet re-measured on the full set. The build also took 299 s for 8 segments, which needs a look.
 - **Sealing blocks by event time is wrong for bulk import.** A 10-minute event-time cap on per-source blocks makes tiny blocks for sparse sources in historical data (one ride every 20 minutes per attraction gives 1 record per block). The import used a huge cap. The real writer should seal on wall-clock age for live data and on size for backfill.
+
+### Round 3b: Bloom filters off (`--no-bloom`), with the memory fix
+
+All 117M rides again, term index built during import:
+
+| | Bloom on | Bloom off |
+|---|---|---|
+| Store | 2.68 GB (22.9 B/record) | **1.45 GB (12.4 B/record), 1.7x Parquet** |
+| Import peak RSS | 6.4 GB (term index build) | **2.37 GB** |
+| Import wall time | 702 s + 299 s separate index build | 1,039 s with the index inline |
+| One guest (34 rows) | 4.5 ms in-process, 29 of 75,191 blocks | 4.1 ms, same 29 blocks |
+
+Queries with Bloom off (fresh processes, against DuckDB): one guest 11 ms vs 288 ms; one attraction-day 9 vs 96 ms; one attraction over all years (792k rows) **1.49 s vs 4.18 s**. Per-source blocks mean WartLog reads only that attraction's blocks, while DuckDB scans every row group. (The earlier 5.26M-row attraction was dominated by JSON output.)
+
+Takeaways:
+
+- **Bloom filters bought nothing here.** The term index did all the pruning. My prediction that the guest lookup would fall back to a full scan was wrong: real guests ride repeatedly, so `guest_id` has fewer distinct values than 10% of a segment's rows and got indexed. My synthetic data had near-unique guests, so it didn't.
+- **That cardinality rule is fragile.** Whether an id field gets indexed depends on segment size and how often values repeat, and it can differ from one segment to the next. The real design should decide per field (config or type: index ids exactly, with small postings) and keep a compact filter only for fields deliberately left out.
+- **Import is bound by single-threaded JSON parsing (about 24 MB/s) plus the inline index build.** On a many-core machine, parse in parallel and build each segment's term index on a background thread.
